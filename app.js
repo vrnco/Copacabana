@@ -65,6 +65,34 @@ function formatDateBR(iso) {
   return `${d}/${m}/${y}`;
 }
 
+// ------------------------------------------------------------
+// Numeração automática das rodadas (Rodada 1, Rodada 2, ...)
+// Sempre calculada na hora, por categoria + circuito, pela ORDEM
+// CRONOLÓGICA das datas das rodadas aprovadas - nunca é salva no
+// banco, então se um dia cadastrarem uma rodada "atrasada" (de uma
+// data anterior), a numeração se ajusta sozinha automaticamente.
+// ------------------------------------------------------------
+
+// Recebe uma lista de datas (round_date, pode ter repetidas) e devolve
+// um Map data -> número da rodada (1, 2, 3...) dentro daquele grupo.
+function buildRoundNumberIndex(dates) {
+  const distinct = [...new Set(dates)].sort();
+  const map = new Map();
+  distinct.forEach((d, i) => map.set(d, i + 1));
+  return map;
+}
+
+// Número da rodada de UMA data específica, dado o histórico de datas já
+// aprovadas daquela categoria+circuito. Funciona tanto para uma rodada já
+// aprovada (retorna a posição dela) quanto para uma ainda não aprovada /
+// futura (calcula qual número ela vai ocupar quando for aprovada).
+function roundNumberForDate(dateISO, approvedDates) {
+  const map = buildRoundNumberIndex(approvedDates);
+  if (map.has(dateISO)) return map.get(dateISO);
+  const distinctBefore = [...map.keys()].filter((d) => d < dateISO).length;
+  return distinctBefore + 1;
+}
+
 function genderLabel(g) {
   return g === 'masculino' ? 'Masculino' : 'Feminino';
 }
@@ -414,9 +442,12 @@ async function renderRound() {
     const round = await findOrCreateRound(category.id, circuit.id, dateISO);
     state.currentRound.round = round;
 
+    const historyRows = await getApprovedPairsHistory(category.id, circuit.id);
+    const roundNumber = roundNumberForDate(dateISO, historyRows.map((h) => h.round_date));
+
     host.innerHTML = '';
     host.append(
-      el('h1', {}, category.name),
+      el('h1', {}, `${category.name} · Rodada ${roundNumber}`),
       el('p', { class: 'muted' }, `${genderLabel(category.gender)} · ${formatDateBR(dateISO)} · Circuito: ${circuit.name}`)
     );
 
@@ -765,9 +796,29 @@ async function renderHistory() {
         const { data, error } = await q;
         if (error) throw error;
 
+        const allRows = data || [];
+
+        // Numeração das rodadas: agrupa por categoria+circuito e numera
+        // pela ordem cronológica das datas (feito ANTES do filtro de
+        // busca por jogador, pra "Rodada N" não mudar conforme a busca).
+        const dateGroups = new Map(); // "categoria|circuito" -> [datas]
+        allRows.forEach((r) => {
+          const key = `${r.round.category_id}|${r.round.circuit_id}`;
+          if (!dateGroups.has(key)) dateGroups.set(key, []);
+          dateGroups.get(key).push(r.round.round_date);
+        });
+        const roundNumberIndexes = new Map(); // "categoria|circuito" -> Map(data -> número)
+        for (const [key, dates] of dateGroups) {
+          roundNumberIndexes.set(key, buildRoundNumberIndex(dates));
+        }
+        function roundNumberOf(r) {
+          const key = `${r.round.category_id}|${r.round.circuit_id}`;
+          return roundNumberIndexes.get(key)?.get(r.round.round_date) || '?';
+        }
+
         // PostgREST não ordena a tabela principal por coluna de tabela
         // relacionada (round.round_date), então ordenamos aqui no cliente.
-        let rows = (data || []).sort((a, b) => (a.round.round_date < b.round.round_date ? 1 : -1));
+        let rows = allRows.sort((a, b) => (a.round.round_date < b.round.round_date ? 1 : -1));
         const term = searchInput.value.trim().toLowerCase();
         if (term) {
           rows = rows.filter(
@@ -784,12 +835,13 @@ async function renderHistory() {
         const tableWrap = el('div', { class: 'table-wrap' });
         const table = el('table');
         table.append(
-          el('thead', {}, el('tr', {}, ['Data', 'Categoria', 'Circuito', 'Dupla', 'Status'].map((h) => el('th', {}, h))))
+          el('thead', {}, el('tr', {}, ['Rodada', 'Data', 'Categoria', 'Circuito', 'Dupla', 'Status'].map((h) => el('th', {}, h))))
         );
         const tbody = el('tbody');
         rows.forEach((r) => {
           tbody.append(
             el('tr', {}, [
+              el('td', {}, `Rodada ${roundNumberOf(r)}`),
               el('td', {}, formatDateBR(r.round.round_date)),
               el('td', {}, r.round.category?.name || ''),
               el('td', {}, r.round.circuit?.name || ''),
