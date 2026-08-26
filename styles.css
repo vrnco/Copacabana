@@ -352,6 +352,20 @@ button {
   color: var(--warn);
 }
 
+/* ---------- Chip do número da rodada ---------- */
+.round-number-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  background: var(--accent);
+  color: var(--accent-contrast);
+  font-weight: 700;
+  font-size: 0.85rem;
+  padding: 0.3rem 0.8rem;
+  border-radius: 999px;
+  margin-bottom: 0.6rem;
+}
+
 /* ---------- Pair cards (draw result) ---------- */
 .pair-card {
   display: flex;
@@ -366,6 +380,72 @@ button {
 
 .pair-card .names {
   font-weight: 600;
+}
+
+/* ---------- Animação do sorteio ---------- */
+.sorteio-animation {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.7rem;
+  padding: 1.2rem 0 0.6rem;
+}
+
+.sorteio-spinner {
+  font-size: 2.6rem;
+  display: inline-block;
+  animation: sorteio-spin 0.9s linear infinite;
+}
+
+.sorteio-label {
+  font-weight: 700;
+  color: var(--accent-dark);
+}
+
+@media (prefers-color-scheme: dark) {
+  .sorteio-label {
+    color: var(--accent);
+  }
+}
+
+.sorteio-shuffle-list {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.pair-card.shuffling {
+  opacity: 0.55;
+  filter: blur(0.2px);
+  animation: sorteio-flicker 0.15s ease-in-out;
+}
+
+@keyframes sorteio-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes sorteio-flicker {
+  from {
+    opacity: 0.15;
+    transform: translateY(-2px);
+  }
+  to {
+    opacity: 0.55;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sorteio-spinner,
+  .pair-card.shuffling {
+    animation: none;
+  }
 }
 
 .pair-card.repeat {
@@ -459,10 +539,31 @@ th {
   max-width: 380px;
 }
 
-.login-logo {
-  text-align: center;
-  font-size: 1.6rem;
-  margin-bottom: 0.2rem;
+/* ---------- Logo Copacabana Beach Club ---------- */
+.brand-logo {
+  display: block;
+  max-width: 220px;
+  width: 70%;
+  height: auto;
+  margin: 0 auto 0.6rem;
+}
+
+.brand-logo-small {
+  display: block;
+  max-width: 160px;
+  width: 45%;
+  height: auto;
+  margin: 0 auto 1rem;
+}
+
+/* a logo é preta com fundo transparente; no modo escuro inverte pra
+   ficar branca (o filtro preserva o canal alfa, então o fundo continua
+   transparente) */
+@media (prefers-color-scheme: dark) {
+  .brand-logo,
+  .brand-logo-small {
+    filter: invert(1);
+  }
 }
 
 .login-sub {

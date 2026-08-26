@@ -1,6 +1,6 @@
 import { createClient } from './supabase-client.js';
 import { SUPABASE_URL, SUPABASE_ANON_KEY } from './config.js';
-import { sortearDuplas, buildHistoryMap, pairKey } from './matching.js';
+import { sortearDuplas, buildHistoryMap, pairKey, shuffle } from './matching.js';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
@@ -324,7 +324,12 @@ async function getApprovedPairsHistory(categoryId, circuitId) {
 async function getPairsForRound(roundId) {
   const { data, error } = await supabase
     .from('pairs')
-    .select('id, is_repeat, player1:players!pairs_player1_id_fkey(id,name), player2:players!pairs_player2_id_fkey(id,name)')
+    .select(
+      `id, is_repeat,
+       player1:players!pairs_player1_id_fkey(id,name),
+       player2:players!pairs_player2_id_fkey(id,name),
+       repeat_of:pairs!pairs_repeat_of_pair_id_fkey(round:rounds(round_date))`
+    )
     .eq('round_id', roundId);
   if (error) throw error;
   return data || [];
@@ -447,12 +452,13 @@ async function renderRound() {
 
     host.innerHTML = '';
     host.append(
-      el('h1', {}, `${category.name} · Rodada ${roundNumber}`),
+      el('div', { class: 'round-number-chip' }, `🎾 Rodada ${roundNumber}`),
+      el('h1', {}, category.name),
       el('p', { class: 'muted' }, `${genderLabel(category.gender)} · ${formatDateBR(dateISO)} · Circuito: ${circuit.name}`)
     );
 
     if (round.status === 'aprovado') {
-      await renderApprovedRound(host, round);
+      await renderApprovedRound(host, round, category, circuit);
       return;
     }
 
@@ -464,15 +470,26 @@ async function renderRound() {
   }
 }
 
-async function renderApprovedRound(host, round) {
-  const pairs = await getPairsForRound(round.id);
+async function renderApprovedRound(host, round, category, circuit) {
+  const [pairs, historyRows] = await Promise.all([
+    getPairsForRound(round.id),
+    getApprovedPairsHistory(category.id, circuit.id),
+  ]);
+  const roundNumberIndex = buildRoundNumberIndex(historyRows.map((h) => h.round_date));
+
   host.append(alertBox('success', 'Esta rodada já foi sorteada e aprovada. Resultado final abaixo (somente leitura).'));
   const list = el('div', { class: 'list' });
   pairs.forEach((p) => {
+    let repeatLabel = 'Repetida';
+    const prevDate = p.repeat_of?.round?.round_date;
+    if (prevDate) {
+      const prevRoundNumber = roundNumberIndex.get(prevDate) || '?';
+      repeatLabel = `Repetida (${formatDateBR(prevDate)} · Rodada ${prevRoundNumber})`;
+    }
     list.append(
       el('div', { class: `pair-card ${p.is_repeat ? 'repeat' : ''}` }, [
         el('span', { class: 'names' }, `${p.player1.name} & ${p.player2.name}`),
-        el('span', { class: `badge ${p.is_repeat ? 'badge-repeat' : 'badge-fresh'}` }, p.is_repeat ? 'Repetida' : 'Inédita'),
+        el('span', { class: `badge ${p.is_repeat ? 'badge-repeat' : 'badge-fresh'}` }, p.is_repeat ? repeatLabel : 'Inédita'),
       ])
     );
   });
@@ -621,20 +638,59 @@ async function renderSorteioStep(host, round, selectedIds, playersToShow) {
   host.append(stepHost);
 
   let draft = null; // resultado do sorteio ainda não aprovado
+  let approvedHistoryRows = []; // cache da última busca de histórico (pra numerar rodadas repetidas)
 
   async function runDraw() {
+    const ANIMATION_MS = 3000;
+
     resultHost.innerHTML = '';
-    resultHost.append(el('p', { class: 'muted' }, 'Sorteando...'));
+    const spinner = el('div', { class: 'sorteio-spinner' }, '🎾');
+    const label = el('div', { class: 'sorteio-label' }, 'Sorteando as duplas...');
+    const shuffleList = el('div', { class: 'sorteio-shuffle-list' });
+    resultHost.append(el('div', { class: 'sorteio-animation' }, [spinner, label, shuffleList]));
+
+    // efeito visual: fica embaralhando os nomes na tela enquanto "sorteia"
+    // (isso é só encenação - o resultado de verdade já está sendo
+    // calculado ao mesmo tempo, no fundo)
+    const shuffleTick = () => {
+      const shuffled = shuffle(playingIds);
+      shuffleList.innerHTML = '';
+      for (let i = 0; i < shuffled.length; i += 2) {
+        const b = shuffled[i + 1];
+        shuffleList.append(
+          el('div', { class: 'pair-card shuffling' }, el('span', { class: 'names' }, b ? `${nameOf(shuffled[i])} & ${nameOf(b)}` : nameOf(shuffled[i])))
+        );
+      }
+    };
+    shuffleTick();
+    const shuffleInterval = setInterval(shuffleTick, 180);
+
+    let result = null;
+    let computeError = null;
     try {
-      const historyRows = await getApprovedPairsHistory(state.currentRound.category.id, state.currentRound.circuit.id);
-      const historyMap = buildHistoryMap(historyRows);
-      const result = sortearDuplas(playingIds, historyMap);
-      draft = result;
-      renderDraftResult();
+      const [computed] = await Promise.all([
+        (async () => {
+          const historyRows = await getApprovedPairsHistory(state.currentRound.category.id, state.currentRound.circuit.id);
+          approvedHistoryRows = historyRows;
+          const historyMap = buildHistoryMap(historyRows);
+          return sortearDuplas(playingIds, historyMap);
+        })(),
+        new Promise((resolve) => setTimeout(resolve, ANIMATION_MS)),
+      ]);
+      result = computed;
     } catch (err) {
-      resultHost.innerHTML = '';
-      resultHost.append(alertBox('error', 'Não foi possível sortear: ' + err.message));
+      computeError = err;
     }
+
+    clearInterval(shuffleInterval);
+
+    if (computeError) {
+      resultHost.innerHTML = '';
+      resultHost.append(alertBox('error', 'Não foi possível sortear: ' + computeError.message));
+      return;
+    }
+    draft = result;
+    renderDraftResult();
   }
 
   function renderDraftResult() {
@@ -650,15 +706,17 @@ async function renderSorteioStep(host, round, selectedIds, playersToShow) {
       resultHost.append(alertBox('success', 'Todas as duplas são inéditas neste circuito!'));
     }
 
+    const roundNumberIndex = buildRoundNumberIndex(approvedHistoryRows.map((h) => h.round_date));
     const list = el('div', { class: 'list' });
     draft.pairs.forEach((p) => {
+      const prevRoundNumber = p.isRepeat ? roundNumberIndex.get(p.lastDate) || '?' : null;
       list.append(
         el('div', { class: `pair-card ${p.isRepeat ? 'repeat' : ''}` }, [
           el('span', { class: 'names' }, `${nameOf(p.a)} & ${nameOf(p.b)}`),
           el(
             'span',
             { class: `badge ${p.isRepeat ? 'badge-repeat' : 'badge-fresh'}` },
-            p.isRepeat ? `Repetida (${formatDateBR(p.lastDate)})` : 'Inédita'
+            p.isRepeat ? `Repetida (${formatDateBR(p.lastDate)} · Rodada ${prevRoundNumber})` : 'Inédita'
           ),
         ])
       );
@@ -1007,7 +1065,32 @@ async function renderAdminCircuitos(host) {
           el('div', {}, c.name),
           el('span', { class: 'muted' }, `${formatDateBR(c.start_date)}${c.end_date ? ' → ' + formatDateBR(c.end_date) : ''}`),
         ]),
-        el('span', { class: `badge ${c.is_active ? 'badge-fresh' : 'badge-repeat'}` }, c.is_active ? 'Ativo' : 'Encerrado'),
+        el('div', { class: 'row' }, [
+          el('span', { class: `badge ${c.is_active ? 'badge-fresh' : 'badge-repeat'}` }, c.is_active ? 'Ativo' : 'Encerrado'),
+          el(
+            'button',
+            {
+              class: 'btn btn-sm',
+              onclick: async () => {
+                const novoNome = prompt('Novo nome do circuito:', c.name);
+                if (novoNome === null) return;
+                const trimmed = novoNome.trim();
+                if (!trimmed) {
+                  alert('O nome não pode ficar em branco.');
+                  return;
+                }
+                try {
+                  const { error: updErr } = await supabase.from('circuits').update({ name: trimmed }).eq('id', c.id);
+                  if (updErr) throw updErr;
+                  renderAdmin('circuitos');
+                } catch (err) {
+                  alert('Erro: ' + err.message);
+                }
+              },
+            },
+            'Renomear'
+          ),
+        ]),
       ])
     );
   });
@@ -1080,17 +1163,68 @@ async function renderAdminCategorias(host) {
           el('div', {}, `${c.name} · ${genderLabel(c.gender)}`),
           el('span', { class: 'muted' }, WEEKDAY_NAMES[c.weekday]),
         ]),
-        el(
-          'button',
-          {
-            class: 'btn btn-sm',
-            onclick: async () => {
-              await supabase.from('categories').update({ is_active: !c.is_active }).eq('id', c.id);
-              renderAdmin('categorias');
+        el('div', { class: 'row' }, [
+          el(
+            'button',
+            {
+              class: 'btn btn-sm',
+              onclick: async () => {
+                const novoNome = prompt('Novo nome da categoria:', c.name);
+                if (novoNome === null) return;
+                const trimmed = novoNome.trim();
+                if (!trimmed) {
+                  alert('O nome não pode ficar em branco.');
+                  return;
+                }
+                try {
+                  const { error: updErr } = await supabase.from('categories').update({ name: trimmed }).eq('id', c.id);
+                  if (updErr) throw updErr;
+                  renderAdmin('categorias');
+                } catch (err) {
+                  alert('Erro: ' + err.message);
+                }
+              },
             },
-          },
-          c.is_active ? 'Desativar' : 'Reativar'
-        ),
+            'Editar nome'
+          ),
+          el(
+            'button',
+            {
+              class: 'btn btn-sm',
+              onclick: async () => {
+                await supabase.from('categories').update({ is_active: !c.is_active }).eq('id', c.id);
+                renderAdmin('categorias');
+              },
+            },
+            c.is_active ? 'Desativar' : 'Reativar'
+          ),
+          el(
+            'button',
+            {
+              class: 'btn btn-sm btn-danger',
+              onclick: async () => {
+                const ok = confirm(
+                  `Excluir a categoria "${c.name}" definitivamente? Isso também remove os jogadores cadastrados nela. Essa ação não pode ser desfeita.`
+                );
+                if (!ok) return;
+                try {
+                  const { error: delErr } = await supabase.from('categories').delete().eq('id', c.id);
+                  if (delErr) throw delErr;
+                  renderAdmin('categorias');
+                } catch (err) {
+                  if (String(err.message).toLowerCase().includes('foreign key') || err.code === '23503') {
+                    alert(
+                      'Não é possível excluir esta categoria porque ela já tem rodadas no histórico. Desative-a em vez de excluir.'
+                    );
+                  } else {
+                    alert('Erro: ' + err.message);
+                  }
+                }
+              },
+            },
+            'Excluir'
+          ),
+        ]),
       ])
     );
   });
