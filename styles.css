@@ -556,12 +556,19 @@ th {
   margin: 0 auto 1rem;
 }
 
+.brand-logo-topbar {
+  display: block;
+  height: 28px;
+  width: auto;
+}
+
 /* a logo é preta com fundo transparente; no modo escuro inverte pra
    ficar branca (o filtro preserva o canal alfa, então o fundo continua
    transparente) */
 @media (prefers-color-scheme: dark) {
   .brand-logo,
-  .brand-logo-small {
+  .brand-logo-small,
+  .brand-logo-topbar {
     filter: invert(1);
   }
 }
