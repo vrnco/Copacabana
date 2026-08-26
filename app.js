@@ -1,0 +1,1163 @@
+import { createClient } from './supabase-client.js';
+import { SUPABASE_URL, SUPABASE_ANON_KEY } from './config.js';
+import { sortearDuplas, buildHistoryMap, pairKey } from './matching.js';
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+const WEEKDAY_NAMES = [
+  'Domingo',
+  'Segunda-feira',
+  'Terça-feira',
+  'Quarta-feira',
+  'Quinta-feira',
+  'Sexta-feira',
+  'Sábado',
+];
+
+// ============================================================
+// Estado global simples
+// ============================================================
+const state = {
+  session: null,
+  profile: null, // { id, name }
+  currentRound: null, // { round, category, circuit, players, draft }
+};
+
+// ============================================================
+// Helpers gerais
+// ============================================================
+function $(sel, root = document) {
+  return root.querySelector(sel);
+}
+function $all(sel, root = document) {
+  return Array.from(root.querySelectorAll(sel));
+}
+function el(tag, attrs = {}, children = []) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'class') node.className = v;
+    else if (k === 'html') node.innerHTML = v;
+    else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2), v);
+    else if (v !== undefined && v !== null) node.setAttribute(k, v);
+  }
+  for (const c of [].concat(children)) {
+    if (c === null || c === undefined) continue;
+    node.append(c instanceof Node ? c : document.createTextNode(String(c)));
+  }
+  return node;
+}
+
+function todayISO() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function todayWeekday() {
+  return new Date().getDay();
+}
+
+function formatDateBR(iso) {
+  if (!iso) return '';
+  const [y, m, d] = iso.split('-');
+  return `${d}/${m}/${y}`;
+}
+
+function genderLabel(g) {
+  return g === 'masculino' ? 'Masculino' : 'Feminino';
+}
+
+function alertBox(kind, message) {
+  return el('div', { class: `alert alert-${kind}` }, message);
+}
+
+function sortIdsPair(a, b) {
+  return a < b ? [a, b] : [b, a];
+}
+
+// ============================================================
+// Navegação entre telas
+// ============================================================
+const VIEWS = ['home', 'round', 'history', 'admin'];
+
+function showView(name) {
+  for (const v of VIEWS) {
+    $(`#view-${v}`).classList.toggle('hidden', v !== name);
+  }
+  $all('#main-nav button').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.view === name);
+  });
+  if (name === 'home') renderHome();
+  if (name === 'history') renderHistory();
+  if (name === 'admin') {
+    $all('.tab-btn').forEach((b) => b.classList.toggle('active', b.dataset.adminTab === 'circuitos'));
+    renderAdmin('circuitos');
+  }
+}
+
+$('#main-nav').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-view]');
+  if (!btn) return;
+  showView(btn.dataset.view);
+});
+
+$('#round-back-btn').addEventListener('click', () => showView('home'));
+
+// ============================================================
+// Autenticação
+// ============================================================
+async function ensureProfile(userId, fallbackEmail) {
+  const { data, error } = await supabase.from('profiles').select('*').eq('id', userId).maybeSingle();
+  if (error) throw error;
+  if (data) return data;
+  // Perfil ainda não existe (esqueceram de criar via SQL) - cria com base no e-mail
+  const name = fallbackEmail ? fallbackEmail.split('@')[0] : 'Administrador';
+  const { data: created, error: insErr } = await supabase
+    .from('profiles')
+    .insert({ id: userId, name })
+    .select()
+    .single();
+  if (insErr) throw insErr;
+  return created;
+}
+
+async function handleLoginSuccess(session) {
+  state.session = session;
+  try {
+    state.profile = await ensureProfile(session.user.id, session.user.email);
+  } catch (err) {
+    console.error(err);
+    state.profile = { id: session.user.id, name: session.user.email || 'Admin' };
+  }
+  $('#view-login').classList.add('hidden');
+  $('#app-root').classList.remove('hidden');
+  $('#user-chip').textContent = state.profile.name;
+  showView('home');
+}
+
+function handleLogout() {
+  state.session = null;
+  state.profile = null;
+  $('#app-root').classList.add('hidden');
+  $('#view-login').classList.remove('hidden');
+}
+
+$('#login-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const email = $('#login-email').value.trim();
+  const password = $('#login-password').value;
+  const alertHost = $('#login-alert');
+  alertHost.innerHTML = '';
+  $('#login-submit').disabled = true;
+  $('#login-submit').textContent = 'Entrando...';
+  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+  $('#login-submit').disabled = false;
+  $('#login-submit').textContent = 'Entrar';
+  if (error) {
+    alertHost.append(alertBox('error', 'Não foi possível entrar: ' + error.message));
+    return;
+  }
+  await handleLoginSuccess(data.session);
+});
+
+$('#logout-btn').addEventListener('click', async () => {
+  await supabase.auth.signOut();
+  handleLogout();
+});
+
+async function bootstrapAuth() {
+  const { data } = await supabase.auth.getSession();
+  if (data.session) {
+    await handleLoginSuccess(data.session);
+  } else {
+    $('#view-login').classList.remove('hidden');
+  }
+}
+
+supabase.auth.onAuthStateChange((event) => {
+  if (event === 'SIGNED_OUT') handleLogout();
+});
+
+// ============================================================
+// Acesso a dados - helpers
+// ============================================================
+async function getActiveCircuit() {
+  const { data, error } = await supabase.from('circuits').select('*').eq('is_active', true).maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function getCategories({ onlyActive = true } = {}) {
+  let q = supabase.from('categories').select('*').order('weekday').order('name');
+  if (onlyActive) q = q.eq('is_active', true);
+  const { data, error } = await q;
+  if (error) throw error;
+  return data || [];
+}
+
+async function getPlayers(categoryId, { onlyActive = true } = {}) {
+  let q = supabase.from('players').select('*').eq('category_id', categoryId).order('name');
+  if (onlyActive) q = q.eq('is_active', true);
+  const { data, error } = await q;
+  if (error) throw error;
+  return data || [];
+}
+
+async function findOrCreateRound(categoryId, circuitId, dateISO) {
+  const { data: existing, error } = await supabase
+    .from('rounds')
+    .select('*')
+    .eq('category_id', categoryId)
+    .eq('circuit_id', circuitId)
+    .eq('round_date', dateISO)
+    .maybeSingle();
+  if (error) throw error;
+  if (existing) return existing;
+
+  const { data: created, error: insErr } = await supabase
+    .from('rounds')
+    .insert({
+      category_id: categoryId,
+      circuit_id: circuitId,
+      round_date: dateISO,
+      status: 'rascunho',
+      created_by: state.profile.id,
+    })
+    .select()
+    .single();
+  if (insErr) {
+    // 23505 = violação de índice único: outro admin já criou essa rodada
+    // no mesmo instante. Em vez de mostrar erro, simplesmente reaproveita.
+    if (insErr.code === '23505') {
+      const { data: raceWinner, error: refetchErr } = await supabase
+        .from('rounds')
+        .select('*')
+        .eq('category_id', categoryId)
+        .eq('circuit_id', circuitId)
+        .eq('round_date', dateISO)
+        .single();
+      if (refetchErr) throw refetchErr;
+      return raceWinner;
+    }
+    throw insErr;
+  }
+  return created;
+}
+
+async function getRoundParticipants(roundId) {
+  const { data, error } = await supabase
+    .from('round_participants')
+    .select('player_id, players(id, name, is_active)')
+    .eq('round_id', roundId);
+  if (error) throw error;
+  return (data || []).map((r) => r.players).filter(Boolean);
+}
+
+async function saveRoundParticipants(roundId, playerIds) {
+  const { error: delErr } = await supabase.from('round_participants').delete().eq('round_id', roundId);
+  if (delErr) throw delErr;
+  if (playerIds.length > 0) {
+    const rows = playerIds.map((pid) => ({ round_id: roundId, player_id: pid }));
+    const { error: insErr } = await supabase.from('round_participants').insert(rows);
+    if (insErr) throw insErr;
+  }
+}
+
+async function updateRound(roundId, patch) {
+  const { data, error } = await supabase.from('rounds').update(patch).eq('id', roundId).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function deleteRound(roundId) {
+  const { error } = await supabase.from('rounds').delete().eq('id', roundId);
+  if (error) throw error;
+}
+
+// Histórico de duplas aprovadas dentro de uma categoria + circuito
+async function getApprovedPairsHistory(categoryId, circuitId) {
+  const { data, error } = await supabase
+    .from('pairs')
+    .select('id, player1_id, player2_id, round:rounds!inner(round_date, status, category_id, circuit_id)')
+    .eq('round.status', 'aprovado')
+    .eq('round.category_id', categoryId)
+    .eq('round.circuit_id', circuitId);
+  if (error) throw error;
+  return (data || []).map((row) => ({
+    id: row.id,
+    player1_id: row.player1_id,
+    player2_id: row.player2_id,
+    round_date: row.round.round_date,
+  }));
+}
+
+async function getPairsForRound(roundId) {
+  const { data, error } = await supabase
+    .from('pairs')
+    .select('id, is_repeat, player1:players!pairs_player1_id_fkey(id,name), player2:players!pairs_player2_id_fkey(id,name)')
+    .eq('round_id', roundId);
+  if (error) throw error;
+  return data || [];
+}
+
+// ============================================================
+// HOME
+// ============================================================
+async function renderHome() {
+  const host = $('#home-content');
+  host.innerHTML = '';
+  host.append(el('p', { class: 'muted' }, 'Carregando...'));
+
+  try {
+    const [circuit, categories] = await Promise.all([getActiveCircuit(), getCategories()]);
+
+    host.innerHTML = '';
+
+    if (!circuit) {
+      host.append(
+        alertBox(
+          'warn',
+          'Nenhum circuito está ativo no momento. Crie um circuito em Administração → Circuitos antes de sortear.'
+        )
+      );
+    }
+
+    if (categories.length === 0) {
+      host.append(alertBox('warn', 'Nenhuma categoria cadastrada ainda. Cadastre em Administração → Categorias.'));
+    }
+
+    const wd = todayWeekday();
+    const todaysCategories = categories.filter((c) => c.weekday === wd);
+    const dateNow = todayISO();
+
+    if (circuit && todaysCategories.length > 0) {
+      todaysCategories.forEach((cat) => {
+        const box = el('div', { class: 'suggestion' }, [
+          el('div', { class: 'muted' }, `Hoje é ${WEEKDAY_NAMES[wd]} · ${formatDateBR(dateNow)}`),
+          el('h2', {}, `Categoria do dia: ${cat.name}`),
+          el('div', { class: 'muted' }, genderLabel(cat.gender)),
+          el(
+            'button',
+            {
+              class: 'btn btn-primary',
+              style: 'margin-top:0.8rem;',
+              onclick: () => goToRound(cat, circuit, dateNow),
+            },
+            'Abrir rodada de hoje'
+          ),
+        ]);
+        host.append(box);
+      });
+    } else if (circuit) {
+      host.append(
+        el('div', { class: 'card' }, [
+          el('h3', {}, 'Hoje'),
+          el('p', { class: 'muted' }, `Nenhuma categoria configurada para ${WEEKDAY_NAMES[wd]}.`),
+        ])
+      );
+    }
+
+    // Abrir outra categoria manualmente
+    if (circuit && categories.length > 0) {
+      const catSelect = el(
+        'select',
+        { id: 'manual-cat-select' },
+        categories.map((c) => el('option', { value: c.id }, `${c.name} (${genderLabel(c.gender)}) · ${WEEKDAY_NAMES[c.weekday]}`))
+      );
+      const dateInput = el('input', { type: 'date', id: 'manual-date-input', value: dateNow });
+
+      host.append(
+        el('div', { class: 'card' }, [
+          el('h3', {}, 'Abrir outra categoria / outra data'),
+          el('div', { class: 'field' }, [el('label', {}, 'Categoria'), catSelect]),
+          el('div', { class: 'field' }, [el('label', {}, 'Data da rodada'), dateInput]),
+          el(
+            'button',
+            {
+              class: 'btn btn-block',
+              onclick: () => {
+                const cat = categories.find((c) => c.id === catSelect.value);
+                goToRound(cat, circuit, dateInput.value);
+              },
+            },
+            'Abrir'
+          ),
+        ])
+      );
+    }
+  } catch (err) {
+    console.error(err);
+    host.innerHTML = '';
+    host.append(alertBox('error', 'Erro ao carregar: ' + err.message));
+  }
+}
+
+function goToRound(category, circuit, dateISO) {
+  state.currentRound = { category, circuit, dateISO };
+  showView('round');
+  renderRound();
+}
+
+// ============================================================
+// RODADA / SORTEIO
+// ============================================================
+async function renderRound() {
+  const host = $('#round-content');
+  host.innerHTML = '';
+  host.append(el('p', { class: 'muted' }, 'Carregando...'));
+
+  const { category, circuit, dateISO } = state.currentRound;
+
+  try {
+    const round = await findOrCreateRound(category.id, circuit.id, dateISO);
+    state.currentRound.round = round;
+
+    host.innerHTML = '';
+    host.append(
+      el('h1', {}, category.name),
+      el('p', { class: 'muted' }, `${genderLabel(category.gender)} · ${formatDateBR(dateISO)} · Circuito: ${circuit.name}`)
+    );
+
+    if (round.status === 'aprovado') {
+      await renderApprovedRound(host, round);
+      return;
+    }
+
+    await renderDraftRound(host, round, category, circuit);
+  } catch (err) {
+    console.error(err);
+    host.innerHTML = '';
+    host.append(alertBox('error', 'Erro: ' + err.message));
+  }
+}
+
+async function renderApprovedRound(host, round) {
+  const pairs = await getPairsForRound(round.id);
+  host.append(alertBox('success', 'Esta rodada já foi sorteada e aprovada. Resultado final abaixo (somente leitura).'));
+  const list = el('div', { class: 'list' });
+  pairs.forEach((p) => {
+    list.append(
+      el('div', { class: `pair-card ${p.is_repeat ? 'repeat' : ''}` }, [
+        el('span', { class: 'names' }, `${p.player1.name} & ${p.player2.name}`),
+        el('span', { class: `badge ${p.is_repeat ? 'badge-repeat' : 'badge-fresh'}` }, p.is_repeat ? 'Repetida' : 'Inédita'),
+      ])
+    );
+  });
+  host.append(list);
+}
+
+async function renderDraftRound(host, round, category, circuit) {
+  const [allPlayers, participants] = await Promise.all([getPlayers(category.id), getRoundParticipants(round.id)]);
+
+  // garante que jogadores já selecionados (mesmo se desativados depois) apareçam
+  const participantIds = new Set(participants.map((p) => p.id));
+  const extraInactive = participants.filter((p) => !allPlayers.some((a) => a.id === p.id));
+  const playersToShow = [...allPlayers, ...extraInactive].sort((a, b) => a.name.localeCompare(b.name));
+
+  if (playersToShow.length === 0) {
+    host.append(alertBox('warn', 'Essa categoria ainda não tem jogadores cadastrados. Cadastre em Administração → Jogadores.'));
+    return;
+  }
+
+  const selectedState = new Map(playersToShow.map((p) => [p.id, participantIds.has(p.id)]));
+
+  const listHost = el('div', { class: 'card' });
+  const title = el('h3', {}, 'Jogadores presentes hoje');
+  const selectAllBtn = el('button', { class: 'btn btn-sm' }, 'Selecionar todos');
+  const selectNoneBtn = el('button', { class: 'btn btn-sm' }, 'Limpar seleção');
+
+  const checklist = el('div', { class: 'list' });
+  function rebuildChecklist() {
+    checklist.innerHTML = '';
+    playersToShow.forEach((p) => {
+      const checkbox = el('input', { type: 'checkbox' });
+      checkbox.checked = !!selectedState.get(p.id);
+      checkbox.addEventListener('change', () => selectedState.set(p.id, checkbox.checked));
+      checklist.append(el('label', { class: 'checkbox-row' }, [checkbox, p.name + (p.is_active === false ? ' (removido)' : '')]));
+    });
+  }
+  rebuildChecklist();
+
+  selectAllBtn.addEventListener('click', () => {
+    playersToShow.forEach((p) => selectedState.set(p.id, true));
+    rebuildChecklist();
+    updateCount();
+  });
+  selectNoneBtn.addEventListener('click', () => {
+    playersToShow.forEach((p) => selectedState.set(p.id, false));
+    rebuildChecklist();
+    updateCount();
+  });
+
+  const countLabel = el('p', { class: 'muted' });
+  function updateCount() {
+    const n = [...selectedState.values()].filter(Boolean).length;
+    countLabel.textContent = `${n} jogador(es) selecionado(s)`;
+  }
+  checklist.addEventListener('change', updateCount);
+  updateCount();
+
+  const continueBtn = el('button', { class: 'btn btn-primary btn-block', style: 'margin-top:0.8rem;' }, 'Confirmar lista e continuar');
+  continueBtn.addEventListener('click', async () => {
+    const selectedIds = playersToShow.filter((p) => selectedState.get(p.id)).map((p) => p.id);
+    if (selectedIds.length < 2) {
+      alert('Selecione pelo menos 2 jogadores.');
+      return;
+    }
+    continueBtn.disabled = true;
+    try {
+      await saveRoundParticipants(round.id, selectedIds);
+      let sitOutId = null;
+      if (selectedIds.length % 2 !== 0) {
+        sitOutId = await promptSitOut(selectedIds, playersToShow);
+        if (!sitOutId) {
+          continueBtn.disabled = false;
+          return; // admin cancelou
+        }
+      }
+      const updated = await updateRound(round.id, { sit_out_player_id: sitOutId });
+      state.currentRound.round = updated;
+      listHost.remove(); // esconde a etapa de seleção, já concluída
+      await renderSorteioStep(host, updated, selectedIds, playersToShow);
+    } catch (err) {
+      alert('Erro ao salvar seleção: ' + err.message);
+      continueBtn.disabled = false;
+    }
+  });
+
+  listHost.append(el('div', { class: 'row between' }, [title, el('div', { class: 'row' }, [selectAllBtn, selectNoneBtn])]), checklist, countLabel, continueBtn);
+  host.append(listHost);
+}
+
+function promptSitOut(selectedIds, playersToShow) {
+  return new Promise((resolve) => {
+    const overlayHost = $('#round-content');
+    const nameOf = (id) => playersToShow.find((p) => p.id === id)?.name || id;
+    const select = el(
+      'select',
+      {},
+      selectedIds.map((id) => el('option', { value: id }, nameOf(id)))
+    );
+    const card = el('div', { class: 'card' }, [
+      el('h3', {}, 'Número ímpar de jogadores'),
+      el('p', { class: 'muted' }, 'Escolha quem fica de fora nesta rodada:'),
+      el('div', { class: 'field' }, select),
+      el('div', { class: 'row' }, [
+        el(
+          'button',
+          {
+            class: 'btn btn-primary',
+            onclick: () => {
+              card.remove();
+              resolve(select.value);
+            },
+          },
+          'Confirmar'
+        ),
+        el(
+          'button',
+          {
+            class: 'btn',
+            onclick: () => {
+              card.remove();
+              resolve(null);
+            },
+          },
+          'Cancelar'
+        ),
+      ]),
+    ]);
+    overlayHost.append(card);
+  });
+}
+
+async function renderSorteioStep(host, round, selectedIds, playersToShow) {
+  // remove qualquer conteúdo de seleção anterior e mostra a etapa do sorteio
+  const nameOf = (id) => playersToShow.find((p) => p.id === id)?.name || '(desconhecido)';
+  const playingIds = selectedIds.filter((id) => id !== round.sit_out_player_id);
+
+  const stepHost = el('div', { class: 'card' });
+  stepHost.append(el('h3', {}, 'Sorteio'));
+  if (round.sit_out_player_id) {
+    stepHost.append(el('p', { class: 'muted' }, `${nameOf(round.sit_out_player_id)} fica de fora nesta rodada.`));
+  }
+  stepHost.append(el('p', { class: 'muted' }, `${playingIds.length} jogadores vão sortear ${playingIds.length / 2} dupla(s).`));
+
+  const resultHost = el('div', { class: 'stack', style: 'margin-top:0.8rem;' });
+  stepHost.append(resultHost);
+  host.append(stepHost);
+
+  let draft = null; // resultado do sorteio ainda não aprovado
+
+  async function runDraw() {
+    resultHost.innerHTML = '';
+    resultHost.append(el('p', { class: 'muted' }, 'Sorteando...'));
+    try {
+      const historyRows = await getApprovedPairsHistory(state.currentRound.category.id, state.currentRound.circuit.id);
+      const historyMap = buildHistoryMap(historyRows);
+      const result = sortearDuplas(playingIds, historyMap);
+      draft = result;
+      renderDraftResult();
+    } catch (err) {
+      resultHost.innerHTML = '';
+      resultHost.append(alertBox('error', 'Não foi possível sortear: ' + err.message));
+    }
+  }
+
+  function renderDraftResult() {
+    resultHost.innerHTML = '';
+    if (draft.repeatsUsed > 0) {
+      resultHost.append(
+        alertBox(
+          'warn',
+          `Não foi possível montar todas as duplas sem repetir. ${draft.repeatsUsed} dupla(s) precisou(aram) repetir - foi(ram) escolhida(s) a(s) que jogaram juntas há mais tempo.`
+        )
+      );
+    } else {
+      resultHost.append(alertBox('success', 'Todas as duplas são inéditas neste circuito!'));
+    }
+
+    const list = el('div', { class: 'list' });
+    draft.pairs.forEach((p) => {
+      list.append(
+        el('div', { class: `pair-card ${p.isRepeat ? 'repeat' : ''}` }, [
+          el('span', { class: 'names' }, `${nameOf(p.a)} & ${nameOf(p.b)}`),
+          el(
+            'span',
+            { class: `badge ${p.isRepeat ? 'badge-repeat' : 'badge-fresh'}` },
+            p.isRepeat ? `Repetida (${formatDateBR(p.lastDate)})` : 'Inédita'
+          ),
+        ])
+      );
+    });
+    resultHost.append(list);
+
+    const actions = el('div', { class: 'row', style: 'margin-top:0.9rem;' }, [
+      el('button', { class: 'btn', onclick: runDraw }, 'Sortear novamente'),
+      el('button', { class: 'btn btn-primary', onclick: approveDraw }, 'Aprovar sorteio'),
+    ]);
+    resultHost.append(actions);
+  }
+
+  async function approveDraw() {
+    if (!draft) return;
+    if (!confirm('Confirmar e salvar este sorteio no histórico? Depois de aprovado não será possível sortear de novo para essa data.')) {
+      return;
+    }
+    try {
+      // busca id da última dupla igual aprovada (para rastreabilidade de repetição)
+      const historyRows = await getApprovedPairsHistory(state.currentRound.category.id, state.currentRound.circuit.id);
+      const rows = draft.pairs.map((p) => {
+        const [player1_id, player2_id] = sortIdsPair(p.a, p.b);
+        let repeat_of_pair_id = null;
+        if (p.isRepeat) {
+          const matches = historyRows
+            .filter((h) => sortIdsPair(h.player1_id, h.player2_id).join('|') === sortIdsPair(p.a, p.b).join('|'))
+            .sort((x, y) => (x.round_date < y.round_date ? 1 : -1));
+          if (matches[0]) repeat_of_pair_id = matches[0].id;
+        }
+        return {
+          round_id: round.id,
+          player1_id,
+          player2_id,
+          is_repeat: p.isRepeat,
+          repeat_of_pair_id,
+        };
+      });
+
+      const { error: insErr } = await supabase.from('pairs').insert(rows);
+      if (insErr) throw insErr;
+
+      await updateRound(round.id, {
+        status: 'aprovado',
+        approved_by: state.profile.id,
+        approved_at: new Date().toISOString(),
+      });
+
+      renderRound();
+    } catch (err) {
+      alert('Erro ao aprovar sorteio: ' + err.message);
+    }
+  }
+
+  const discardBtn = el(
+    'button',
+    {
+      class: 'btn btn-danger',
+      style: 'margin-top:0.6rem;',
+      onclick: async () => {
+        if (!confirm('Descartar esta rodada (rascunho) e voltar para o início?')) return;
+        try {
+          await deleteRound(round.id);
+          showView('home');
+        } catch (err) {
+          alert('Erro: ' + err.message);
+        }
+      },
+    },
+    'Descartar rascunho da rodada'
+  );
+
+  const drawBtn = el('button', { class: 'btn btn-primary btn-block' }, 'Sortear duplas');
+  drawBtn.addEventListener('click', () => {
+    drawBtn.remove();
+    runDraw();
+  });
+  resultHost.append(drawBtn);
+  stepHost.append(discardBtn);
+}
+
+// ============================================================
+// HISTÓRICO
+// ============================================================
+async function renderHistory() {
+  const host = $('#history-content');
+  host.innerHTML = '';
+  host.append(el('p', { class: 'muted' }, 'Carregando...'));
+
+  try {
+    const [circuits, categories] = await Promise.all([
+      supabase.from('circuits').select('*').order('start_date', { ascending: false }).then((r) => r.data || []),
+      getCategories({ onlyActive: false }),
+    ]);
+    const activeCircuit = circuits.find((c) => c.is_active);
+
+    host.innerHTML = '';
+
+    const circuitSelect = el(
+      'select',
+      { id: 'hist-circuit' },
+      [el('option', { value: '' }, 'Todos os circuitos'), ...circuits.map((c) => el('option', { value: c.id }, c.name))]
+    );
+    if (activeCircuit) circuitSelect.value = activeCircuit.id;
+
+    const categorySelect = el(
+      'select',
+      { id: 'hist-category' },
+      [el('option', { value: '' }, 'Todas as categorias'), ...categories.map((c) => el('option', { value: c.id }, c.name))]
+    );
+
+    const searchInput = el('input', { type: 'text', placeholder: 'Buscar por nome do jogador...' });
+
+    const resultsHost = el('div', { style: 'margin-top:1rem;' });
+
+    async function refreshResults() {
+      resultsHost.innerHTML = '';
+      resultsHost.append(el('p', { class: 'muted' }, 'Buscando...'));
+      try {
+        let q = supabase
+          .from('pairs')
+          .select(
+            `id, is_repeat,
+             player1:players!pairs_player1_id_fkey(id,name),
+             player2:players!pairs_player2_id_fkey(id,name),
+             round:rounds!inner(id, round_date, status, category_id, circuit_id,
+               category:categories(name),
+               circuit:circuits(name))`
+          )
+          .eq('round.status', 'aprovado');
+
+        if (circuitSelect.value) q = q.eq('round.circuit_id', circuitSelect.value);
+        if (categorySelect.value) q = q.eq('round.category_id', categorySelect.value);
+
+        const { data, error } = await q;
+        if (error) throw error;
+
+        // PostgREST não ordena a tabela principal por coluna de tabela
+        // relacionada (round.round_date), então ordenamos aqui no cliente.
+        let rows = (data || []).sort((a, b) => (a.round.round_date < b.round.round_date ? 1 : -1));
+        const term = searchInput.value.trim().toLowerCase();
+        if (term) {
+          rows = rows.filter(
+            (r) => r.player1.name.toLowerCase().includes(term) || r.player2.name.toLowerCase().includes(term)
+          );
+        }
+
+        resultsHost.innerHTML = '';
+        if (rows.length === 0) {
+          resultsHost.append(alertBox('warn', 'Nenhum resultado encontrado.'));
+          return;
+        }
+
+        const tableWrap = el('div', { class: 'table-wrap' });
+        const table = el('table');
+        table.append(
+          el('thead', {}, el('tr', {}, ['Data', 'Categoria', 'Circuito', 'Dupla', 'Status'].map((h) => el('th', {}, h))))
+        );
+        const tbody = el('tbody');
+        rows.forEach((r) => {
+          tbody.append(
+            el('tr', {}, [
+              el('td', {}, formatDateBR(r.round.round_date)),
+              el('td', {}, r.round.category?.name || ''),
+              el('td', {}, r.round.circuit?.name || ''),
+              el('td', {}, `${r.player1.name} & ${r.player2.name}`),
+              el('td', {}, el('span', { class: `badge ${r.is_repeat ? 'badge-repeat' : 'badge-fresh'}` }, r.is_repeat ? 'Repetida' : 'Inédita')),
+            ])
+          );
+        });
+        table.append(tbody);
+        tableWrap.append(table);
+        resultsHost.append(tableWrap);
+      } catch (err) {
+        resultsHost.innerHTML = '';
+        resultsHost.append(alertBox('error', 'Erro: ' + err.message));
+      }
+    }
+
+    [circuitSelect, categorySelect].forEach((s) => s.addEventListener('change', refreshResults));
+    let searchTimeout;
+    searchInput.addEventListener('input', () => {
+      clearTimeout(searchTimeout);
+      searchTimeout = setTimeout(refreshResults, 300);
+    });
+
+    host.append(
+      el('div', { class: 'card' }, [
+        el('h3', {}, 'Filtros'),
+        el('div', { class: 'field' }, [el('label', {}, 'Circuito'), circuitSelect]),
+        el('div', { class: 'field' }, [el('label', {}, 'Categoria'), categorySelect]),
+        el('div', { class: 'field' }, [el('label', {}, 'Jogador'), searchInput]),
+      ]),
+      resultsHost
+    );
+
+    await refreshResults();
+    await renderConferenceTool(host, categories);
+  } catch (err) {
+    console.error(err);
+    host.innerHTML = '';
+    host.append(alertBox('error', 'Erro ao carregar histórico: ' + err.message));
+  }
+}
+
+async function renderConferenceTool(host, categories) {
+  const allPlayersByCategory = await Promise.all(
+    categories.map(async (c) => ({ category: c, players: await getPlayers(c.id, { onlyActive: false }) }))
+  );
+
+  function buildPlayerSelect() {
+    return el(
+      'select',
+      {},
+      allPlayersByCategory
+        .filter((g) => g.players.length > 0)
+        .map((g) => el('optgroup', { label: g.category.name }, g.players.map((p) => el('option', { value: p.id }, p.name))))
+    );
+  }
+
+  const selectA = buildPlayerSelect();
+  const selectB = buildPlayerSelect();
+  const resultHost = el('div', { style: 'margin-top:0.8rem;' });
+
+  const checkBtn = el('button', { class: 'btn btn-primary' }, 'Verificar');
+  checkBtn.addEventListener('click', async () => {
+    resultHost.innerHTML = '';
+    if (selectA.value === selectB.value) {
+      resultHost.append(alertBox('warn', 'Escolha dois jogadores diferentes.'));
+      return;
+    }
+    resultHost.append(el('p', { class: 'muted' }, 'Verificando...'));
+    try {
+      const [p1, p2] = sortIdsPair(selectA.value, selectB.value);
+      const { data, error } = await supabase
+        .from('pairs')
+        .select(
+          `id, round:rounds!inner(round_date, status, category:categories(name), circuit:circuits(name))`
+        )
+        .eq('round.status', 'aprovado')
+        .eq('player1_id', p1)
+        .eq('player2_id', p2);
+      if (error) throw error;
+
+      // ordena no cliente (PostgREST não ordena a tabela principal por
+      // coluna de uma tabela relacionada)
+      const rows = (data || []).sort((a, b) => (a.round.round_date < b.round.round_date ? 1 : -1));
+
+      resultHost.innerHTML = '';
+      const nameA = selectA.options[selectA.selectedIndex].textContent;
+      const nameB = selectB.options[selectB.selectedIndex].textContent;
+      if (rows.length === 0) {
+        resultHost.append(alertBox('success', `${nameA} e ${nameB} nunca formaram dupla (no filtro atual).`));
+        return;
+      }
+      resultHost.append(alertBox('warn', `${nameA} e ${nameB} já jogaram juntos ${rows.length} vez(es):`));
+      const list = el('div', { class: 'list' });
+      rows.forEach((r) => {
+        list.append(
+          el('div', { class: 'list-item' }, [
+            `${formatDateBR(r.round.round_date)} · ${r.round.category?.name || ''}`,
+            el('span', { class: 'muted' }, r.round.circuit?.name || ''),
+          ])
+        );
+      });
+      resultHost.append(list);
+    } catch (err) {
+      resultHost.innerHTML = '';
+      resultHost.append(alertBox('error', 'Erro: ' + err.message));
+    }
+  });
+
+  host.append(
+    el('div', { class: 'card' }, [
+      el('h3', {}, 'Já jogaram juntos? (conferência)'),
+      el('div', { class: 'row' }, [
+        el('div', { class: 'field', style: 'flex:1;min-width:140px;' }, [el('label', {}, 'Jogador 1'), selectA]),
+        el('div', { class: 'field', style: 'flex:1;min-width:140px;' }, [el('label', {}, 'Jogador 2'), selectB]),
+      ]),
+      checkBtn,
+      resultHost,
+    ])
+  );
+}
+
+// ============================================================
+// ADMIN
+// ============================================================
+function setupAdminTabs() {
+  $all('.tab-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      $all('.tab-btn').forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      renderAdmin(btn.dataset.adminTab);
+    });
+  });
+}
+
+async function renderAdmin(tab) {
+  const host = $('#admin-content');
+  host.innerHTML = '';
+  host.append(el('p', { class: 'muted' }, 'Carregando...'));
+  try {
+    if (tab === 'circuitos') await renderAdminCircuitos(host);
+    else if (tab === 'categorias') await renderAdminCategorias(host);
+    else if (tab === 'jogadores') await renderAdminJogadores(host);
+  } catch (err) {
+    host.innerHTML = '';
+    host.append(alertBox('error', 'Erro: ' + err.message));
+  }
+}
+
+async function renderAdminCircuitos(host) {
+  const { data: circuits, error } = await supabase.from('circuits').select('*').order('start_date', { ascending: false });
+  if (error) throw error;
+  host.innerHTML = '';
+
+  const active = circuits.find((c) => c.is_active);
+
+  const list = el('div', { class: 'list' });
+  circuits.forEach((c) => {
+    list.append(
+      el('div', { class: 'list-item' }, [
+        el('div', {}, [
+          el('div', {}, c.name),
+          el('span', { class: 'muted' }, `${formatDateBR(c.start_date)}${c.end_date ? ' → ' + formatDateBR(c.end_date) : ''}`),
+        ]),
+        el('span', { class: `badge ${c.is_active ? 'badge-fresh' : 'badge-repeat'}` }, c.is_active ? 'Ativo' : 'Encerrado'),
+      ])
+    );
+  });
+
+  const nameInput = el('input', { type: 'text', placeholder: 'Ex: Circuito 2026.2' });
+  const dateInput = el('input', { type: 'date', value: todayISO() });
+
+  const createBtn = el('button', { class: 'btn btn-primary btn-block' }, 'Criar novo circuito');
+  createBtn.addEventListener('click', async () => {
+    if (!nameInput.value.trim()) {
+      alert('Dê um nome ao circuito.');
+      return;
+    }
+    if (active) {
+      const ok = confirm(
+        `Isso vai encerrar o circuito atual "${active.name}" e reiniciar o histórico de duplas repetidas. Confirma?`
+      );
+      if (!ok) return;
+    }
+    try {
+      if (active) {
+        await supabase.from('circuits').update({ is_active: false, end_date: todayISO() }).eq('id', active.id);
+      }
+      const { error: insErr } = await supabase
+        .from('circuits')
+        .insert({ name: nameInput.value.trim(), start_date: dateInput.value, is_active: true });
+      if (insErr) throw insErr;
+      renderAdmin('circuitos');
+    } catch (err) {
+      alert('Erro: ' + err.message);
+    }
+  });
+
+  host.append(
+    el('div', { class: 'card' }, [el('h3', {}, 'Circuitos'), list]),
+    el('div', { class: 'card' }, [
+      el('h3', {}, 'Novo circuito'),
+      el('div', { class: 'field' }, [el('label', {}, 'Nome'), nameInput]),
+      el('div', { class: 'field' }, [el('label', {}, 'Data de início'), dateInput]),
+      createBtn,
+      active
+        ? el(
+            'button',
+            {
+              class: 'btn btn-danger btn-block',
+              style: 'margin-top:0.6rem;',
+              onclick: async () => {
+                if (!confirm(`Encerrar o circuito "${active.name}" sem criar outro agora?`)) return;
+                await supabase.from('circuits').update({ is_active: false, end_date: todayISO() }).eq('id', active.id);
+                renderAdmin('circuitos');
+              },
+            },
+            'Encerrar circuito atual'
+          )
+        : null,
+    ])
+  );
+}
+
+async function renderAdminCategorias(host) {
+  const { data: categories, error } = await supabase.from('categories').select('*').order('weekday').order('name');
+  if (error) throw error;
+  host.innerHTML = '';
+
+  const list = el('div', { class: 'list' });
+  categories.forEach((c) => {
+    list.append(
+      el('div', { class: 'list-item' }, [
+        el('div', {}, [
+          el('div', {}, `${c.name} · ${genderLabel(c.gender)}`),
+          el('span', { class: 'muted' }, WEEKDAY_NAMES[c.weekday]),
+        ]),
+        el(
+          'button',
+          {
+            class: 'btn btn-sm',
+            onclick: async () => {
+              await supabase.from('categories').update({ is_active: !c.is_active }).eq('id', c.id);
+              renderAdmin('categorias');
+            },
+          },
+          c.is_active ? 'Desativar' : 'Reativar'
+        ),
+      ])
+    );
+  });
+
+  const nameInput = el('input', { type: 'text', placeholder: 'Ex: Masculino B' });
+  const genderSelect = el('select', {}, [el('option', { value: 'masculino' }, 'Masculino'), el('option', { value: 'feminino' }, 'Feminino')]);
+  const weekdaySelect = el('select', {}, WEEKDAY_NAMES.map((n, i) => el('option', { value: i }, n)));
+
+  const createBtn = el('button', { class: 'btn btn-primary btn-block' }, 'Adicionar categoria');
+  createBtn.addEventListener('click', async () => {
+    if (!nameInput.value.trim()) {
+      alert('Dê um nome à categoria.');
+      return;
+    }
+    try {
+      const { error: insErr } = await supabase.from('categories').insert({
+        name: nameInput.value.trim(),
+        gender: genderSelect.value,
+        weekday: Number(weekdaySelect.value),
+      });
+      if (insErr) throw insErr;
+      nameInput.value = '';
+      renderAdmin('categorias');
+    } catch (err) {
+      alert('Erro: ' + err.message);
+    }
+  });
+
+  host.append(
+    el('div', { class: 'card' }, [el('h3', {}, 'Categorias cadastradas'), list]),
+    el('div', { class: 'card' }, [
+      el('h3', {}, 'Nova categoria'),
+      el('div', { class: 'field' }, [el('label', {}, 'Nome'), nameInput]),
+      el('div', { class: 'field' }, [el('label', {}, 'Gênero'), genderSelect]),
+      el('div', { class: 'field' }, [el('label', {}, 'Dia da semana da rodada'), weekdaySelect]),
+      createBtn,
+    ])
+  );
+}
+
+async function renderAdminJogadores(host) {
+  const { data: categories, error } = await supabase.from('categories').select('*').order('name');
+  if (error) throw error;
+  host.innerHTML = '';
+
+  if (categories.length === 0) {
+    host.append(alertBox('warn', 'Cadastre uma categoria primeiro, na aba Categorias.'));
+    return;
+  }
+
+  const catSelect = el('select', {}, categories.map((c) => el('option', { value: c.id }, c.name)));
+  const listHost = el('div');
+
+  async function refreshList() {
+    listHost.innerHTML = '';
+    listHost.append(el('p', { class: 'muted' }, 'Carregando...'));
+    const players = await getPlayers(catSelect.value, { onlyActive: false });
+    listHost.innerHTML = '';
+    const list = el('div', { class: 'list' });
+    if (players.length === 0) {
+      list.append(el('p', { class: 'muted' }, 'Nenhum jogador nesta categoria ainda.'));
+    }
+    players.forEach((p) => {
+      list.append(
+        el('div', { class: 'list-item' }, [
+          p.name + (p.is_active ? '' : ' (removido)'),
+          el(
+            'button',
+            {
+              class: 'btn btn-sm',
+              onclick: async () => {
+                await supabase.from('players').update({ is_active: !p.is_active }).eq('id', p.id);
+                refreshList();
+              },
+            },
+            p.is_active ? 'Remover' : 'Reativar'
+          ),
+        ])
+      );
+    });
+    listHost.append(list);
+  }
+
+  catSelect.addEventListener('change', refreshList);
+
+  const nameInput = el('input', { type: 'text', placeholder: 'Nome do jogador' });
+  const addBtn = el('button', { class: 'btn btn-primary btn-block' }, 'Adicionar jogador');
+  addBtn.addEventListener('click', async () => {
+    if (!nameInput.value.trim()) return;
+    try {
+      const { error: insErr } = await supabase
+        .from('players')
+        .insert({ category_id: catSelect.value, name: nameInput.value.trim() });
+      if (insErr) throw insErr;
+      nameInput.value = '';
+      refreshList();
+    } catch (err) {
+      alert('Erro: ' + err.message);
+    }
+  });
+
+  host.append(
+    el('div', { class: 'card' }, [
+      el('h3', {}, 'Categoria'),
+      catSelect,
+    ]),
+    el('div', { class: 'card' }, [el('h3', {}, 'Jogadores'), listHost]),
+    el('div', { class: 'card' }, [
+      el('h3', {}, 'Adicionar jogador'),
+      el('div', { class: 'field' }, [el('label', {}, 'Nome'), nameInput]),
+      addBtn,
+    ])
+  );
+
+  await refreshList();
+}
+
+// ============================================================
+// Boot
+// ============================================================
+setupAdminTabs();
+bootstrapAuth();

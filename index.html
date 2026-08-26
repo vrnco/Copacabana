@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Sorteio de Duplas · Beach Tennis</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎾</text></svg>" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <!-- ===================== LOGIN ===================== -->
+  <div id="view-login" class="login-wrap hidden">
+    <div class="card login-card">
+      <div class="login-logo">🎾🏖️</div>
+      <h1 class="login-sub" style="margin-bottom:0.2rem;">Sorteio de Duplas</h1>
+      <p class="muted login-sub">Circuito de Beach Tennis da Arena</p>
+
+      <div id="login-alert"></div>
+
+      <form id="login-form" class="stack">
+        <div class="field">
+          <label for="login-email">E-mail</label>
+          <input type="email" id="login-email" autocomplete="username" required />
+        </div>
+        <div class="field">
+          <label for="login-password">Senha</label>
+          <input type="password" id="login-password" autocomplete="current-password" required />
+        </div>
+        <button type="submit" class="btn btn-primary btn-block" id="login-submit">Entrar</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- ===================== APP (logado) ===================== -->
+  <div id="app-root" class="hidden">
+    <div class="topbar">
+      <div class="topbar-inner">
+        <div class="brand">🎾 Sorteio de Duplas</div>
+        <nav class="nav" id="main-nav">
+          <button data-view="home" class="active">Início</button>
+          <button data-view="history">Histórico</button>
+          <button data-view="admin">Administração</button>
+        </nav>
+        <div class="row">
+          <span class="user-chip" id="user-chip"></span>
+          <button class="btn btn-sm" id="logout-btn">Sair</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="app-shell">
+
+      <!-- ===================== HOME ===================== -->
+      <section id="view-home" class="view">
+        <div id="home-content"><p class="muted">Carregando...</p></div>
+      </section>
+
+      <!-- ===================== RODADA / SORTEIO ===================== -->
+      <section id="view-round" class="view hidden">
+        <button class="btn btn-sm" id="round-back-btn" style="margin-bottom:0.8rem;">← Voltar</button>
+        <div id="round-content"></div>
+      </section>
+
+      <!-- ===================== HISTÓRICO ===================== -->
+      <section id="view-history" class="view hidden">
+        <h1>Histórico de duplas</h1>
+        <div id="history-content"></div>
+      </section>
+
+      <!-- ===================== ADMIN ===================== -->
+      <section id="view-admin" class="view hidden">
+        <h1>Administração</h1>
+        <div class="tabs">
+          <button class="tab-btn active" data-admin-tab="circuitos">Circuitos</button>
+          <button class="tab-btn" data-admin-tab="categorias">Categorias</button>
+          <button class="tab-btn" data-admin-tab="jogadores">Jogadores</button>
+        </div>
+        <div id="admin-content"></div>
+      </section>
+
+    </div>
+
+    <footer class="hint app-shell">
+      <p class="muted">Feito para uso simples no celular ou notebook.</p>
+    </footer>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
