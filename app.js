@@ -21,6 +21,7 @@ const state = {
   session: null,
   profile: null, // { id, name }
   currentRound: null, // { round, category, circuit, players, draft }
+  historyPreselectCircuitId: null, // usado pelo botão "Ver histórico" em Administração → Circuitos
 };
 
 // ============================================================
@@ -820,7 +821,12 @@ async function renderHistory() {
       { id: 'hist-circuit' },
       [el('option', { value: '' }, 'Todos os circuitos'), ...circuits.map((c) => el('option', { value: c.id }, c.name))]
     );
-    if (activeCircuit) circuitSelect.value = activeCircuit.id;
+    if (state.historyPreselectCircuitId) {
+      circuitSelect.value = state.historyPreselectCircuitId;
+      state.historyPreselectCircuitId = null;
+    } else if (activeCircuit) {
+      circuitSelect.value = activeCircuit.id;
+    }
 
     const categorySelect = el(
       'select',
@@ -928,6 +934,11 @@ async function renderHistory() {
       el('div', { class: 'card' }, [
         el('h3', {}, 'Filtros'),
         el('div', { class: 'field' }, [el('label', {}, 'Circuito'), circuitSelect]),
+        el(
+          'p',
+          { class: 'muted', style: 'margin:-0.3rem 0 0.6rem;' },
+          'Encerrar um circuito não apaga nada: escolha-o aqui (ou "Todos os circuitos") pra ver o histórico dele.'
+        ),
         el('div', { class: 'field' }, [el('label', {}, 'Categoria'), categorySelect]),
         el('div', { class: 'field' }, [el('label', {}, 'Jogador'), searchInput]),
       ]),
@@ -1090,6 +1101,41 @@ async function renderAdminCircuitos(host) {
             },
             'Renomear'
           ),
+          el(
+            'button',
+            {
+              class: 'btn btn-sm',
+              onclick: () => {
+                state.historyPreselectCircuitId = c.id;
+                showView('history');
+              },
+            },
+            'Ver histórico'
+          ),
+          !c.is_active
+            ? el(
+                'button',
+                {
+                  class: 'btn btn-sm btn-danger',
+                  onclick: async () => {
+                    const ok = confirm(
+                      `Excluir definitivamente o circuito "${c.name}" e TODO o histórico de rodadas e duplas dele? Essa ação não pode ser desfeita.`
+                    );
+                    if (!ok) return;
+                    try {
+                      const { error: delRoundsErr } = await supabase.from('rounds').delete().eq('circuit_id', c.id);
+                      if (delRoundsErr) throw delRoundsErr;
+                      const { error: delCircuitErr } = await supabase.from('circuits').delete().eq('id', c.id);
+                      if (delCircuitErr) throw delCircuitErr;
+                      renderAdmin('circuitos');
+                    } catch (err) {
+                      alert('Erro: ' + err.message);
+                    }
+                  },
+                },
+                'Excluir'
+              )
+            : null,
         ]),
       ])
     );
