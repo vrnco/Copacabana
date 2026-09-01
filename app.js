@@ -212,15 +212,18 @@ supabase.auth.onAuthStateChange((event) => {
 // ============================================================
 // Acesso a dados - helpers
 // ============================================================
-async function getActiveCircuit() {
-  const { data, error } = await supabase.from('circuits').select('*').eq('is_active', true).maybeSingle();
+async function getCircuits({ onlyActive = false } = {}) {
+  let q = supabase.from('circuits').select('*').order('start_date', { ascending: false });
+  if (onlyActive) q = q.eq('is_active', true);
+  const { data, error } = await q;
   if (error) throw error;
-  return data;
+  return data || [];
 }
 
-async function getCategories({ onlyActive = true } = {}) {
-  let q = supabase.from('categories').select('*').order('weekday').order('name');
+async function getCategories({ onlyActive = true, circuitId } = {}) {
+  let q = supabase.from('categories').select('*, circuit:circuits(id,name,is_active)').order('weekday').order('name');
   if (onlyActive) q = q.eq('is_active', true);
+  if (circuitId) q = q.eq('circuit_id', circuitId);
   const { data, error } = await q;
   if (error) throw error;
   return data || [];
@@ -345,33 +348,38 @@ async function renderHome() {
   host.append(el('p', { class: 'muted' }, 'Carregando...'));
 
   try {
-    const [circuit, categories] = await Promise.all([getActiveCircuit(), getCategories()]);
+    const [activeCircuits, categories] = await Promise.all([getCircuits({ onlyActive: true }), getCategories()]);
 
     host.innerHTML = '';
 
-    if (!circuit) {
+    const activeCircuitIds = new Set(activeCircuits.map((c) => c.id));
+    // só considera categorias cujo circuito ainda está ativo (uma categoria
+    // pode continuar "ativa" mas pertencer a um circuito já encerrado)
+    const activeCategories = categories.filter((c) => activeCircuitIds.has(c.circuit_id));
+    const multiploCircuitos = activeCircuits.length > 1;
+
+    if (activeCircuits.length === 0) {
       host.append(
         alertBox(
           'warn',
           'Nenhum circuito está ativo no momento. Crie um circuito em Administração → Circuitos antes de sortear.'
         )
       );
-    }
-
-    if (categories.length === 0) {
-      host.append(alertBox('warn', 'Nenhuma categoria cadastrada ainda. Cadastre em Administração → Categorias.'));
+    } else if (activeCategories.length === 0) {
+      host.append(alertBox('warn', 'Nenhuma categoria cadastrada ainda nos circuitos ativos. Cadastre em Administração → Categorias.'));
     }
 
     const wd = todayWeekday();
-    const todaysCategories = categories.filter((c) => c.weekday === wd);
+    const todaysCategories = activeCategories.filter((c) => c.weekday === wd);
     const dateNow = todayISO();
 
-    if (circuit && todaysCategories.length > 0) {
+    if (todaysCategories.length > 0) {
       todaysCategories.forEach((cat) => {
+        const circuit = activeCircuits.find((ci) => ci.id === cat.circuit_id);
         const box = el('div', { class: 'suggestion' }, [
           el('div', { class: 'muted' }, `Hoje é ${WEEKDAY_NAMES[wd]} · ${formatDateBR(dateNow)}`),
           el('h2', {}, `Categoria do dia: ${cat.name}`),
-          el('div', { class: 'muted' }, genderLabel(cat.gender)),
+          el('div', { class: 'muted' }, `${genderLabel(cat.gender)}${multiploCircuitos ? ' · ' + circuit.name : ''}`),
           el(
             'button',
             {
@@ -384,7 +392,7 @@ async function renderHome() {
         ]);
         host.append(box);
       });
-    } else if (circuit) {
+    } else if (activeCircuits.length > 0) {
       host.append(
         el('div', { class: 'card' }, [
           el('h3', {}, 'Hoje'),
@@ -394,11 +402,15 @@ async function renderHome() {
     }
 
     // Abrir outra categoria manualmente
-    if (circuit && categories.length > 0) {
+    if (activeCategories.length > 0) {
       const catSelect = el(
         'select',
         { id: 'manual-cat-select' },
-        categories.map((c) => el('option', { value: c.id }, `${c.name} (${genderLabel(c.gender)}) · ${WEEKDAY_NAMES[c.weekday]}`))
+        activeCategories.map((c) => {
+          const circuit = activeCircuits.find((ci) => ci.id === c.circuit_id);
+          const label = `${c.name} (${genderLabel(c.gender)}) · ${WEEKDAY_NAMES[c.weekday]}${multiploCircuitos ? ' · ' + circuit.name : ''}`;
+          return el('option', { value: c.id }, label);
+        })
       );
       const dateInput = el('input', { type: 'date', id: 'manual-date-input', value: dateNow });
 
@@ -412,7 +424,8 @@ async function renderHome() {
             {
               class: 'btn btn-block',
               onclick: () => {
-                const cat = categories.find((c) => c.id === catSelect.value);
+                const cat = activeCategories.find((c) => c.id === catSelect.value);
+                const circuit = activeCircuits.find((ci) => ci.id === cat.circuit_id);
                 goToRound(cat, circuit, dateInput.value);
               },
             },
@@ -831,7 +844,10 @@ async function renderHistory() {
     const categorySelect = el(
       'select',
       { id: 'hist-category' },
-      [el('option', { value: '' }, 'Todas as categorias'), ...categories.map((c) => el('option', { value: c.id }, c.name))]
+      [
+        el('option', { value: '' }, 'Todas as categorias'),
+        ...categories.map((c) => el('option', { value: c.id }, `${c.name}${c.circuit ? ' · ' + c.circuit.name : ''}`)),
+      ]
     );
 
     const searchInput = el('input', { type: 'text', placeholder: 'Buscar por nome do jogador...' });
@@ -1062,11 +1078,8 @@ async function renderAdmin(tab) {
 }
 
 async function renderAdminCircuitos(host) {
-  const { data: circuits, error } = await supabase.from('circuits').select('*').order('start_date', { ascending: false });
-  if (error) throw error;
+  const circuits = await getCircuits();
   host.innerHTML = '';
-
-  const active = circuits.find((c) => c.is_active);
 
   const list = el('div', { class: 'list' });
   circuits.forEach((c) => {
@@ -1112,6 +1125,31 @@ async function renderAdminCircuitos(host) {
             },
             'Ver histórico'
           ),
+          c.is_active
+            ? el(
+                'button',
+                {
+                  class: 'btn btn-sm',
+                  onclick: async () => {
+                    const ok = confirm(
+                      `Encerrar o circuito "${c.name}"? Ele para de aparecer para novos sorteios, mas todo o histórico continua salvo (dá pra consultar em "Ver histórico" e, se precisar, excluir depois).`
+                    );
+                    if (!ok) return;
+                    try {
+                      const { error } = await supabase
+                        .from('circuits')
+                        .update({ is_active: false, end_date: todayISO() })
+                        .eq('id', c.id);
+                      if (error) throw error;
+                      renderAdmin('circuitos');
+                    } catch (err) {
+                      alert('Erro: ' + err.message);
+                    }
+                  },
+                },
+                'Encerrar'
+              )
+            : null,
           !c.is_active
             ? el(
                 'button',
@@ -1119,7 +1157,7 @@ async function renderAdminCircuitos(host) {
                   class: 'btn btn-sm btn-danger',
                   onclick: async () => {
                     const ok = confirm(
-                      `Excluir definitivamente o circuito "${c.name}" e TODO o histórico de rodadas e duplas dele? Essa ação não pode ser desfeita.`
+                      `Excluir definitivamente o circuito "${c.name}" e TODO o histórico dele (rodadas, duplas, categorias e jogadores)? Essa ação não pode ser desfeita.`
                     );
                     if (!ok) return;
                     try {
@@ -1150,20 +1188,12 @@ async function renderAdminCircuitos(host) {
       alert('Dê um nome ao circuito.');
       return;
     }
-    if (active) {
-      const ok = confirm(
-        `Isso vai encerrar o circuito atual "${active.name}" e reiniciar o histórico de duplas repetidas. Confirma?`
-      );
-      if (!ok) return;
-    }
     try {
-      if (active) {
-        await supabase.from('circuits').update({ is_active: false, end_date: todayISO() }).eq('id', active.id);
-      }
       const { error: insErr } = await supabase
         .from('circuits')
         .insert({ name: nameInput.value.trim(), start_date: dateInput.value, is_active: true });
       if (insErr) throw insErr;
+      nameInput.value = '';
       renderAdmin('circuitos');
     } catch (err) {
       alert('Erro: ' + err.message);
@@ -1174,146 +1204,210 @@ async function renderAdminCircuitos(host) {
     el('div', { class: 'card' }, [el('h3', {}, 'Circuitos'), list]),
     el('div', { class: 'card' }, [
       el('h3', {}, 'Novo circuito'),
+      el(
+        'p',
+        { class: 'muted', style: 'margin:-0.3rem 0 0.8rem;' },
+        'Dá pra ter mais de um circuito ativo ao mesmo tempo - útil se você roda circuitos em paralelo. Criar um novo não encerra os outros.'
+      ),
       el('div', { class: 'field' }, [el('label', {}, 'Nome'), nameInput]),
       el('div', { class: 'field' }, [el('label', {}, 'Data de início'), dateInput]),
       createBtn,
-      active
-        ? el(
-            'button',
-            {
-              class: 'btn btn-danger btn-block',
-              style: 'margin-top:0.6rem;',
-              onclick: async () => {
-                if (!confirm(`Encerrar o circuito "${active.name}" sem criar outro agora?`)) return;
-                await supabase.from('circuits').update({ is_active: false, end_date: todayISO() }).eq('id', active.id);
-                renderAdmin('circuitos');
-              },
-            },
-            'Encerrar circuito atual'
-          )
-        : null,
     ])
   );
 }
 
 async function renderAdminCategorias(host) {
-  const { data: categories, error } = await supabase.from('categories').select('*').order('weekday').order('name');
-  if (error) throw error;
+  const [circuits, activeCircuits, categories] = await Promise.all([
+    getCircuits(),
+    getCircuits({ onlyActive: true }),
+    getCategories({ onlyActive: false }),
+  ]);
   host.innerHTML = '';
 
-  const list = el('div', { class: 'list' });
-  categories.forEach((c) => {
-    list.append(
-      el('div', { class: 'list-item' }, [
-        el('div', {}, [
-          el('div', {}, `${c.name} · ${genderLabel(c.gender)}`),
-          el('span', { class: 'muted' }, WEEKDAY_NAMES[c.weekday]),
-        ]),
-        el('div', { class: 'row' }, [
-          el(
-            'button',
-            {
-              class: 'btn btn-sm',
-              onclick: async () => {
-                const novoNome = prompt('Novo nome da categoria:', c.name);
-                if (novoNome === null) return;
-                const trimmed = novoNome.trim();
-                if (!trimmed) {
-                  alert('O nome não pode ficar em branco.');
-                  return;
-                }
-                try {
-                  const { error: updErr } = await supabase.from('categories').update({ name: trimmed }).eq('id', c.id);
-                  if (updErr) throw updErr;
-                  renderAdmin('categorias');
-                } catch (err) {
-                  alert('Erro: ' + err.message);
-                }
-              },
-            },
-            'Editar nome'
-          ),
-          el(
-            'button',
-            {
-              class: 'btn btn-sm',
-              onclick: async () => {
-                await supabase.from('categories').update({ is_active: !c.is_active }).eq('id', c.id);
-                renderAdmin('categorias');
-              },
-            },
-            c.is_active ? 'Desativar' : 'Reativar'
-          ),
-          el(
-            'button',
-            {
-              class: 'btn btn-sm btn-danger',
-              onclick: async () => {
-                const ok = confirm(
-                  `Excluir a categoria "${c.name}" definitivamente? Isso também remove os jogadores cadastrados nela. Essa ação não pode ser desfeita.`
-                );
-                if (!ok) return;
-                try {
-                  const { error: delErr } = await supabase.from('categories').delete().eq('id', c.id);
-                  if (delErr) throw delErr;
-                  renderAdmin('categorias');
-                } catch (err) {
-                  if (String(err.message).toLowerCase().includes('foreign key') || err.code === '23503') {
-                    alert(
-                      'Não é possível excluir esta categoria porque ela já tem rodadas no histórico. Desative-a em vez de excluir.'
-                    );
-                  } else {
-                    alert('Erro: ' + err.message);
-                  }
-                }
-              },
-            },
-            'Excluir'
-          ),
-        ]),
-      ])
-    );
-  });
+  const filterSelect = el('select', { id: 'cat-filter-circuit' }, [
+    el('option', { value: '' }, 'Todos os circuitos'),
+    ...circuits.map((ci) => el('option', { value: ci.id }, `${ci.name}${ci.is_active ? '' : ' (encerrado)'}`)),
+  ]);
 
-  const nameInput = el('input', { type: 'text', placeholder: 'Ex: Masculino B' });
-  const genderSelect = el('select', {}, [el('option', { value: 'masculino' }, 'Masculino'), el('option', { value: 'feminino' }, 'Feminino')]);
-  const weekdaySelect = el('select', {}, WEEKDAY_NAMES.map((n, i) => el('option', { value: i }, n)));
+  const listHost = el('div', { class: 'list' });
 
-  const createBtn = el('button', { class: 'btn btn-primary btn-block' }, 'Adicionar categoria');
-  createBtn.addEventListener('click', async () => {
-    if (!nameInput.value.trim()) {
-      alert('Dê um nome à categoria.');
+  function renderList() {
+    listHost.innerHTML = '';
+    const filtered = filterSelect.value ? categories.filter((c) => c.circuit_id === filterSelect.value) : categories;
+    if (filtered.length === 0) {
+      listHost.append(el('p', { class: 'muted' }, 'Nenhuma categoria encontrada.'));
       return;
     }
-    try {
-      const { error: insErr } = await supabase.from('categories').insert({
-        name: nameInput.value.trim(),
-        gender: genderSelect.value,
-        weekday: Number(weekdaySelect.value),
+    filtered.forEach((c) => {
+      const circuitMoveSelect = el(
+        'select',
+        { style: 'width:auto;' },
+        circuits.map((ci) => el('option', { value: ci.id }, `${ci.name}${ci.is_active ? '' : ' (encerrado)'}`))
+      );
+      circuitMoveSelect.value = c.circuit_id;
+      circuitMoveSelect.addEventListener('change', async () => {
+        const novoCircuito = circuits.find((ci) => ci.id === circuitMoveSelect.value);
+        const ok = confirm(`Mover a categoria "${c.name}" para o circuito "${novoCircuito.name}"?`);
+        if (!ok) {
+          circuitMoveSelect.value = c.circuit_id;
+          return;
+        }
+        try {
+          const { error: updErr } = await supabase
+            .from('categories')
+            .update({ circuit_id: circuitMoveSelect.value })
+            .eq('id', c.id);
+          if (updErr) throw updErr;
+          renderAdmin('categorias');
+        } catch (err) {
+          alert('Erro: ' + err.message);
+          circuitMoveSelect.value = c.circuit_id;
+        }
       });
-      if (insErr) throw insErr;
-      nameInput.value = '';
-      renderAdmin('categorias');
-    } catch (err) {
-      alert('Erro: ' + err.message);
-    }
-  });
 
-  host.append(
-    el('div', { class: 'card' }, [el('h3', {}, 'Categorias cadastradas'), list]),
-    el('div', { class: 'card' }, [
+      listHost.append(
+        el('div', { class: 'list-item' }, [
+          el('div', {}, [
+            el('div', {}, `${c.name} · ${genderLabel(c.gender)}`),
+            el('span', { class: 'muted' }, `${WEEKDAY_NAMES[c.weekday]} · ${c.circuit?.name || '(circuito removido)'}`),
+          ]),
+          el('div', { class: 'row' }, [
+            circuitMoveSelect,
+            el(
+              'button',
+              {
+                class: 'btn btn-sm',
+                onclick: async () => {
+                  const novoNome = prompt('Novo nome da categoria:', c.name);
+                  if (novoNome === null) return;
+                  const trimmed = novoNome.trim();
+                  if (!trimmed) {
+                    alert('O nome não pode ficar em branco.');
+                    return;
+                  }
+                  try {
+                    const { error: updErr } = await supabase.from('categories').update({ name: trimmed }).eq('id', c.id);
+                    if (updErr) throw updErr;
+                    renderAdmin('categorias');
+                  } catch (err) {
+                    alert('Erro: ' + err.message);
+                  }
+                },
+              },
+              'Editar nome'
+            ),
+            el(
+              'button',
+              {
+                class: 'btn btn-sm',
+                onclick: async () => {
+                  await supabase.from('categories').update({ is_active: !c.is_active }).eq('id', c.id);
+                  renderAdmin('categorias');
+                },
+              },
+              c.is_active ? 'Desativar' : 'Reativar'
+            ),
+            el(
+              'button',
+              {
+                class: 'btn btn-sm btn-danger',
+                onclick: async () => {
+                  const ok = confirm(
+                    `Excluir a categoria "${c.name}" definitivamente? Isso também remove os jogadores cadastrados nela. Essa ação não pode ser desfeita.`
+                  );
+                  if (!ok) return;
+                  try {
+                    const { error: delErr } = await supabase.from('categories').delete().eq('id', c.id);
+                    if (delErr) throw delErr;
+                    renderAdmin('categorias');
+                  } catch (err) {
+                    if (String(err.message).toLowerCase().includes('foreign key') || err.code === '23503') {
+                      alert(
+                        'Não é possível excluir esta categoria porque ela já tem rodadas no histórico. Desative-a em vez de excluir.'
+                      );
+                    } else {
+                      alert('Erro: ' + err.message);
+                    }
+                  }
+                },
+              },
+              'Excluir'
+            ),
+          ]),
+        ])
+      );
+    });
+  }
+
+  filterSelect.addEventListener('change', renderList);
+  renderList();
+
+  let createCard;
+  if (activeCircuits.length === 0) {
+    createCard = el('div', { class: 'card' }, [
       el('h3', {}, 'Nova categoria'),
+      alertBox('warn', 'Crie um circuito ativo em Administração → Circuitos antes de cadastrar uma categoria.'),
+    ]);
+  } else {
+    const circuitCreateSelect = el(
+      'select',
+      { id: 'cat-create-circuit' },
+      activeCircuits.map((ci) => el('option', { value: ci.id }, ci.name))
+    );
+    const nameInput = el('input', { type: 'text', placeholder: 'Ex: Masculino B' });
+    const genderSelect = el('select', { id: 'cat-create-gender' }, [
+      el('option', { value: 'masculino' }, 'Masculino'),
+      el('option', { value: 'feminino' }, 'Feminino'),
+    ]);
+    const weekdaySelect = el(
+      'select',
+      { id: 'cat-create-weekday' },
+      WEEKDAY_NAMES.map((n, i) => el('option', { value: i }, n))
+    );
+
+    const createBtn = el('button', { class: 'btn btn-primary btn-block' }, 'Adicionar categoria');
+    createBtn.addEventListener('click', async () => {
+      if (!nameInput.value.trim()) {
+        alert('Dê um nome à categoria.');
+        return;
+      }
+      try {
+        const { error: insErr } = await supabase.from('categories').insert({
+          circuit_id: circuitCreateSelect.value,
+          name: nameInput.value.trim(),
+          gender: genderSelect.value,
+          weekday: Number(weekdaySelect.value),
+        });
+        if (insErr) throw insErr;
+        nameInput.value = '';
+        renderAdmin('categorias');
+      } catch (err) {
+        alert('Erro: ' + err.message);
+      }
+    });
+
+    createCard = el('div', { class: 'card' }, [
+      el('h3', {}, 'Nova categoria'),
+      el('div', { class: 'field' }, [el('label', {}, 'Circuito'), circuitCreateSelect]),
       el('div', { class: 'field' }, [el('label', {}, 'Nome'), nameInput]),
       el('div', { class: 'field' }, [el('label', {}, 'Gênero'), genderSelect]),
       el('div', { class: 'field' }, [el('label', {}, 'Dia da semana da rodada'), weekdaySelect]),
       createBtn,
-    ])
+    ]);
+  }
+
+  host.append(
+    el('div', { class: 'card' }, [
+      el('h3', {}, 'Categorias cadastradas'),
+      el('div', { class: 'field' }, [el('label', {}, 'Filtrar por circuito'), filterSelect]),
+      listHost,
+    ]),
+    createCard
   );
 }
 
 async function renderAdminJogadores(host) {
-  const { data: categories, error } = await supabase.from('categories').select('*').order('name');
-  if (error) throw error;
+  const categories = await getCategories({ onlyActive: false });
   host.innerHTML = '';
 
   if (categories.length === 0) {
@@ -1321,7 +1415,11 @@ async function renderAdminJogadores(host) {
     return;
   }
 
-  const catSelect = el('select', {}, categories.map((c) => el('option', { value: c.id }, c.name)));
+  const catSelect = el(
+    'select',
+    {},
+    categories.map((c) => el('option', { value: c.id }, `${c.name}${c.circuit ? ' · ' + c.circuit.name : ''}`))
+  );
   const listHost = el('div');
 
   async function refreshList() {
