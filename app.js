@@ -102,6 +102,15 @@ function alertBox(kind, message) {
   return el('div', { class: `alert alert-${kind}` }, message);
 }
 
+// Pede confirmação DUAS vezes antes de qualquer exclusão definitiva
+// (proteção extra contra clique sem querer em ações irreversíveis).
+function confirmDelete(label, detail = '') {
+  const detailSuffix = detail ? `\n\n${detail}` : '';
+  if (!confirm(`Tem certeza que quer excluir ${label}?${detailSuffix}`)) return false;
+  if (!confirm(`Confirmando de novo: excluir ${label} definitivamente? Essa ação não pode ser desfeita.`)) return false;
+  return true;
+}
+
 function sortIdsPair(a, b) {
   return a < b ? [a, b] : [b, a];
 }
@@ -1156,8 +1165,9 @@ async function renderAdminCircuitos(host) {
                 {
                   class: 'btn btn-sm btn-danger',
                   onclick: async () => {
-                    const ok = confirm(
-                      `Excluir definitivamente o circuito "${c.name}" e TODO o histórico dele (rodadas, duplas, categorias e jogadores)? Essa ação não pode ser desfeita.`
+                    const ok = confirmDelete(
+                      `o circuito "${c.name}"`,
+                      'Isso remove TODO o histórico dele: rodadas, duplas, categorias e jogadores.'
                     );
                     if (!ok) return;
                     try {
@@ -1312,8 +1322,9 @@ async function renderAdminCategorias(host) {
               {
                 class: 'btn btn-sm btn-danger',
                 onclick: async () => {
-                  const ok = confirm(
-                    `Excluir a categoria "${c.name}" definitivamente? Isso também remove os jogadores cadastrados nela. Essa ação não pode ser desfeita.`
+                  const ok = confirmDelete(
+                    `a categoria "${c.name}"`,
+                    'Isso também remove os jogadores cadastrados nela.'
                   );
                   if (!ok) return;
                   try {
@@ -1421,31 +1432,92 @@ async function renderAdminJogadores(host) {
     categories.map((c) => el('option', { value: c.id }, `${c.name}${c.circuit ? ' · ' + c.circuit.name : ''}`))
   );
   const listHost = el('div');
+  let showRemoved = false;
 
   async function refreshList() {
     listHost.innerHTML = '';
     listHost.append(el('p', { class: 'muted' }, 'Carregando...'));
     const players = await getPlayers(catSelect.value, { onlyActive: false });
     listHost.innerHTML = '';
+    const visiblePlayers = showRemoved ? players : players.filter((p) => p.is_active);
+
     const list = el('div', { class: 'list' });
-    if (players.length === 0) {
-      list.append(el('p', { class: 'muted' }, 'Nenhum jogador nesta categoria ainda.'));
+    if (visiblePlayers.length === 0) {
+      list.append(
+        el(
+          'p',
+          { class: 'muted' },
+          showRemoved ? 'Nenhum jogador nesta categoria ainda.' : 'Nenhum jogador ativo nesta categoria ainda.'
+        )
+      );
     }
-    players.forEach((p) => {
+    visiblePlayers.forEach((p) => {
       list.append(
         el('div', { class: 'list-item' }, [
-          p.name + (p.is_active ? '' : ' (removido)'),
-          el(
-            'button',
-            {
-              class: 'btn btn-sm',
-              onclick: async () => {
-                await supabase.from('players').update({ is_active: !p.is_active }).eq('id', p.id);
-                refreshList();
+          el('div', {}, p.name + (p.is_active ? '' : ' (removido)')),
+          el('div', { class: 'row' }, [
+            el(
+              'button',
+              {
+                class: 'btn btn-sm',
+                onclick: async () => {
+                  const novoNome = prompt('Novo nome do jogador:', p.name);
+                  if (novoNome === null) return;
+                  const trimmed = novoNome.trim();
+                  if (!trimmed) {
+                    alert('O nome não pode ficar em branco.');
+                    return;
+                  }
+                  try {
+                    const { error: updErr } = await supabase.from('players').update({ name: trimmed }).eq('id', p.id);
+                    if (updErr) throw updErr;
+                    refreshList();
+                  } catch (err) {
+                    alert('Erro: ' + err.message);
+                  }
+                },
               },
-            },
-            p.is_active ? 'Remover' : 'Reativar'
-          ),
+              'Editar nome'
+            ),
+            p.is_active
+              ? el(
+                  'button',
+                  {
+                    class: 'btn btn-sm btn-danger',
+                    onclick: async () => {
+                      const ok = confirmDelete(`o jogador "${p.name}"`);
+                      if (!ok) return;
+                      try {
+                        const { error: delErr } = await supabase.from('players').delete().eq('id', p.id);
+                        if (delErr) throw delErr;
+                        refreshList();
+                      } catch (err) {
+                        if (String(err.message).toLowerCase().includes('foreign key') || err.code === '23503') {
+                          await supabase.from('players').update({ is_active: false }).eq('id', p.id);
+                          alert(
+                            `"${p.name}" já tem duplas no histórico, então não dá pra apagar por completo (isso estragaria o histórico). Ele foi removido das listas de seleção.`
+                          );
+                          refreshList();
+                        } else {
+                          alert('Erro: ' + err.message);
+                        }
+                      }
+                    },
+                  },
+                  'Excluir'
+                )
+              : el(
+                  'button',
+                  {
+                    class: 'btn btn-sm',
+                    onclick: async () => {
+                      await supabase.from('players').update({ is_active: true }).eq('id', p.id);
+                      refreshList();
+                    },
+                  },
+                  'Reativar'
+                ),
+          ]),
         ])
       );
     });
@@ -1453,6 +1525,16 @@ async function renderAdminJogadores(host) {
   }
 
   catSelect.addEventListener('change', refreshList);
+
+  const showRemovedCheckbox = el('input', { type: 'checkbox' });
+  showRemovedCheckbox.addEventListener('change', () => {
+    showRemoved = showRemovedCheckbox.checked;
+    refreshList();
+  });
+  const showRemovedLabel = el('label', { class: 'row', style: 'gap:0.4rem; margin-top:0.6rem; cursor:pointer;' }, [
+    showRemovedCheckbox,
+    el('span', { class: 'muted' }, 'Mostrar jogadores removidos'),
+  ]);
 
   const nameInput = el('input', { type: 'text', placeholder: 'Nome do jogador' });
   const addBtn = el('button', { class: 'btn btn-primary btn-block' }, 'Adicionar jogador');
@@ -1475,7 +1557,7 @@ async function renderAdminJogadores(host) {
       el('h3', {}, 'Categoria'),
       catSelect,
     ]),
-    el('div', { class: 'card' }, [el('h3', {}, 'Jogadores'), listHost]),
+    el('div', { class: 'card' }, [el('h3', {}, 'Jogadores'), listHost, showRemovedLabel]),
     el('div', { class: 'card' }, [
       el('h3', {}, 'Adicionar jogador'),
       el('div', { class: 'field' }, [el('label', {}, 'Nome'), nameInput]),
