@@ -1438,6 +1438,7 @@ async function renderAdminJogadores(host) {
     listHost.innerHTML = '';
     listHost.append(el('p', { class: 'muted' }, 'Carregando...'));
     const players = await getPlayers(catSelect.value, { onlyActive: false });
+    players.sort((a, b) => a.name.localeCompare(b.name, 'pt-BR', { sensitivity: 'base' }));
     listHost.innerHTML = '';
     const visiblePlayers = showRemoved ? players : players.filter((p) => p.is_active);
 
@@ -1538,7 +1539,8 @@ async function renderAdminJogadores(host) {
 
   const nameInput = el('input', { type: 'text', placeholder: 'Nome do jogador' });
   const addBtn = el('button', { class: 'btn btn-primary btn-block' }, 'Adicionar jogador');
-  addBtn.addEventListener('click', async () => {
+
+  async function addPlayer() {
     if (!nameInput.value.trim()) return;
     try {
       const { error: insErr } = await supabase
@@ -1546,9 +1548,18 @@ async function renderAdminJogadores(host) {
         .insert({ category_id: catSelect.value, name: nameInput.value.trim() });
       if (insErr) throw insErr;
       nameInput.value = '';
+      nameInput.focus();
       refreshList();
     } catch (err) {
       alert('Erro: ' + err.message);
+    }
+  }
+
+  addBtn.addEventListener('click', addPlayer);
+  nameInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      addPlayer();
     }
   });
 
@@ -1557,12 +1568,12 @@ async function renderAdminJogadores(host) {
       el('h3', {}, 'Categoria'),
       catSelect,
     ]),
-    el('div', { class: 'card' }, [el('h3', {}, 'Jogadores'), listHost, showRemovedLabel]),
     el('div', { class: 'card' }, [
       el('h3', {}, 'Adicionar jogador'),
       el('div', { class: 'field' }, [el('label', {}, 'Nome'), nameInput]),
       addBtn,
-    ])
+    ]),
+    el('div', { class: 'card' }, [el('h3', {}, 'Jogadores'), listHost, showRemovedLabel])
   );
 
   await refreshList();
