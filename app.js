@@ -334,6 +334,19 @@ async function getApprovedPairsHistory(categoryId, circuitId) {
   }));
 }
 
+// Todas as rodadas já aprovadas de uma categoria+circuito (mais recente primeiro)
+async function getApprovedRounds(categoryId, circuitId) {
+  const { data, error } = await supabase
+    .from('rounds')
+    .select('*')
+    .eq('category_id', categoryId)
+    .eq('circuit_id', circuitId)
+    .eq('status', 'aprovado')
+    .order('round_date');
+  if (error) throw error;
+  return (data || []).sort((a, b) => (a.round_date < b.round_date ? 1 : -1));
+}
+
 async function getPairsForRound(roundId) {
   const { data, error } = await supabase
     .from('pairs')
@@ -1103,6 +1116,7 @@ async function renderAdmin(tab) {
     if (tab === 'circuitos') await renderAdminCircuitos(host);
     else if (tab === 'categorias') await renderAdminCategorias(host);
     else if (tab === 'jogadores') await renderAdminJogadores(host);
+    else if (tab === 'sorteios') await renderAdminSorteios(host);
   } catch (err) {
     host.innerHTML = '';
     host.append(alertBox('error', 'Erro: ' + err.message));
@@ -1600,6 +1614,111 @@ async function renderAdminJogadores(host) {
   );
 
   await refreshList();
+}
+
+async function renderAdminSorteios(host) {
+  const [circuits, categories] = await Promise.all([getCircuits(), getCategories({ onlyActive: false })]);
+  host.innerHTML = '';
+
+  if (circuits.length === 0) {
+    host.append(el('div', { class: 'card' }, [alertBox('warn', 'Nenhum circuito cadastrado ainda.')]));
+    return;
+  }
+
+  const circuitSelect = el(
+    'select',
+    { id: 'del-sorteio-circuit' },
+    circuits.map((ci) => el('option', { value: ci.id }, `${ci.name}${ci.is_active ? '' : ' (encerrado)'}`))
+  );
+  const categorySelect = el('select', { id: 'del-sorteio-category' });
+  const roundsHost = el('div', { class: 'list', style: 'margin-top:1rem;' });
+
+  function categoriesForCircuit(circuitId) {
+    return categories.filter((c) => c.circuit_id === circuitId);
+  }
+
+  async function refreshRounds() {
+    roundsHost.innerHTML = '';
+    const category = categories.find((c) => c.id === categorySelect.value);
+    if (!category) {
+      roundsHost.append(el('p', { class: 'muted' }, 'Escolha uma categoria para ver os sorteios já aprovados.'));
+      return;
+    }
+    roundsHost.append(el('p', { class: 'muted' }, 'Carregando...'));
+    try {
+      const rounds = await getApprovedRounds(category.id, circuitSelect.value);
+      roundsHost.innerHTML = '';
+      if (rounds.length === 0) {
+        roundsHost.append(el('p', { class: 'muted' }, 'Essa categoria não tem nenhum sorteio aprovado nesse circuito.'));
+        return;
+      }
+      const roundNumberIndex = buildRoundNumberIndex(rounds.map((r) => r.round_date));
+      rounds.forEach((round) => {
+        const roundNumber = roundNumberIndex.get(round.round_date) || '?';
+        roundsHost.append(
+          el('div', { class: 'list-item' }, [
+            el('div', {}, [
+              el('div', {}, `Rodada ${roundNumber} · ${formatDateBR(round.round_date)}`),
+              el('span', { class: 'muted' }, category.name),
+            ]),
+            el(
+              'button',
+              {
+                class: 'btn btn-sm btn-danger',
+                onclick: async () => {
+                  const ok = confirmDelete(
+                    `o sorteio de "${category.name}" do dia ${formatDateBR(round.round_date)}`,
+                    'Use isso quando a rodada não aconteceu de verdade (ex: chuva). As duplas sorteadas aqui saem do histórico (deixam de contar como "já jogaram juntas") e essa data fica livre pra sortear de novo do zero.'
+                  );
+                  if (!ok) return;
+                  try {
+                    await deleteRound(round.id);
+                    await refreshRounds();
+                  } catch (err) {
+                    alert('Erro: ' + err.message);
+                  }
+                },
+              },
+              'Excluir sorteio'
+            ),
+          ])
+        );
+      });
+    } catch (err) {
+      roundsHost.innerHTML = '';
+      roundsHost.append(alertBox('error', 'Erro: ' + err.message));
+    }
+  }
+
+  function refreshCategoryOptions() {
+    const opts = categoriesForCircuit(circuitSelect.value);
+    categorySelect.innerHTML = '';
+    if (opts.length === 0) {
+      categorySelect.append(el('option', { value: '' }, '(nenhuma categoria nesse circuito)'));
+    } else {
+      opts.forEach((c) => categorySelect.append(el('option', { value: c.id }, `${c.name} · ${genderLabel(c.gender)}`)));
+    }
+    refreshRounds();
+  }
+
+  circuitSelect.addEventListener('change', refreshCategoryOptions);
+  categorySelect.addEventListener('change', refreshRounds);
+
+  refreshCategoryOptions();
+
+  host.append(
+    el('div', { class: 'card' }, [
+      el('h3', {}, 'Excluir um sorteio já aprovado'),
+      el(
+        'p',
+        { class: 'muted' },
+        'Escolha o circuito, a categoria e a data do sorteio que precisa ser excluído (ex: rodada que não aconteceu por causa de chuva). Ao excluir, o sorteio some do histórico e a data fica livre para sortear de novo.'
+      ),
+      el('div', { class: 'field' }, [el('label', {}, 'Circuito'), circuitSelect]),
+      el('div', { class: 'field' }, [el('label', {}, 'Categoria'), categorySelect]),
+      roundsHost,
+    ])
+  );
 }
 
 // ============================================================
