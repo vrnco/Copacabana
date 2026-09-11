@@ -517,6 +517,29 @@ async function renderApprovedRound(host, round, category, circuit) {
     );
   });
   host.append(list);
+
+  const deleteBtn = el(
+    'button',
+    {
+      class: 'btn btn-danger',
+      style: 'margin-top:1rem;',
+      onclick: async () => {
+        const ok = confirmDelete(
+          `o sorteio de "${category.name}" do dia ${formatDateBR(round.round_date)}`,
+          'Use isso quando a rodada não aconteceu de verdade (ex: chuva). As duplas sorteadas aqui saem do histórico (deixam de contar como "já jogaram juntas") e essa data fica livre pra sortear de novo do zero.'
+        );
+        if (!ok) return;
+        try {
+          await deleteRound(round.id);
+          showView('home');
+        } catch (err) {
+          alert('Erro: ' + err.message);
+        }
+      },
+    },
+    'Excluir sorteio (liberar para sortear de novo)'
+  );
+  host.append(deleteBtn);
 }
 
 async function renderDraftRound(host, round, category, circuit) {
