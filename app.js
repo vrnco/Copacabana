@@ -848,12 +848,159 @@ async function renderSorteioStep(host, round, selectedIds, playersToShow) {
     'Descartar rascunho da rodada'
   );
 
+  async function renderManualPairing() {
+    resultHost.innerHTML = '';
+    resultHost.append(el('p', { class: 'muted' }, 'Carregando histórico...'));
+    const historyRows = await getApprovedPairsHistory(state.currentRound.category.id, state.currentRound.circuit.id);
+    approvedHistoryRows = historyRows;
+    resultHost.innerHTML = '';
+
+    resultHost.append(
+      alertBox(
+        'warn',
+        'Use isso só quando as duplas já foram decididas fora do sistema (ex: sorteio feito na quadra, no papel). O objetivo aqui é só registrar o resultado, pra valer no histórico e essas duplas não serem sorteadas de novo depois.'
+      )
+    );
+
+    let remaining = [...playingIds];
+    const pairs = []; // { a, b }
+
+    const poolHost = el('p', { class: 'muted' });
+    const pairsHost = el('div', { class: 'list' });
+    const formHost = el('div', { class: 'row', style: 'margin-top:0.5rem; align-items:flex-end;' });
+
+    function renderPool() {
+      poolHost.textContent =
+        remaining.length > 0 ? `Falta parear: ${remaining.map(nameOf).join(', ')}` : 'Todos os jogadores já foram pareados.';
+    }
+
+    function renderPairsList() {
+      pairsHost.innerHTML = '';
+      pairs.forEach((pair, idx) => {
+        pairsHost.append(
+          el('div', { class: 'pair-card' }, [
+            el('span', { class: 'names' }, `${nameOf(pair.a)} & ${nameOf(pair.b)}`),
+            el(
+              'button',
+              {
+                class: 'btn btn-sm',
+                onclick: () => {
+                  remaining.push(pair.a, pair.b);
+                  pairs.splice(idx, 1);
+                  renderPool();
+                  renderPairsList();
+                  renderForm();
+                },
+              },
+              'Remover'
+            ),
+          ])
+        );
+      });
+    }
+
+    function renderForm() {
+      formHost.innerHTML = '';
+      if (remaining.length < 2) return;
+      const selectA = el(
+        'select',
+        {},
+        remaining.map((id) => el('option', { value: id }, nameOf(id)))
+      );
+      const selectB = el(
+        'select',
+        {},
+        remaining.map((id) => el('option', { value: id }, nameOf(id)))
+      );
+      selectB.value = remaining[1];
+      const addBtn = el('button', { class: 'btn btn-sm' }, 'Adicionar dupla');
+      addBtn.addEventListener('click', () => {
+        const a = selectA.value;
+        const b = selectB.value;
+        if (a === b) {
+          alert('Escolha dois jogadores diferentes para formar a dupla.');
+          return;
+        }
+        pairs.push({ a, b });
+        remaining = remaining.filter((id) => id !== a && id !== b);
+        renderPool();
+        renderPairsList();
+        renderForm();
+      });
+      formHost.append(
+        el('div', { class: 'field' }, [el('label', {}, 'Jogador 1'), selectA]),
+        el('div', { class: 'field' }, [el('label', {}, 'Jogador 2'), selectB]),
+        addBtn
+      );
+    }
+
+    const saveBtn = el('button', { class: 'btn btn-primary btn-block', style: 'margin-top:1rem;' }, 'Salvar duplas lançadas manualmente');
+    saveBtn.addEventListener('click', async () => {
+      if (remaining.length > 0 || pairs.length === 0) {
+        alert('Falta parear todo mundo antes de salvar.');
+        return;
+      }
+      if (
+        !confirm('Confirmar e salvar essas duplas no histórico? Depois de salvo não será possível sortear de novo para essa data.')
+      ) {
+        return;
+      }
+      saveBtn.disabled = true;
+      try {
+        const rows = pairs.map((p) => {
+          const [player1_id, player2_id] = sortIdsPair(p.a, p.b);
+          const matches = historyRows
+            .filter((h) => sortIdsPair(h.player1_id, h.player2_id).join('|') === [player1_id, player2_id].join('|'))
+            .sort((x, y) => (x.round_date < y.round_date ? 1 : -1));
+          return {
+            round_id: round.id,
+            player1_id,
+            player2_id,
+            is_repeat: matches.length > 0,
+            repeat_of_pair_id: matches[0]?.id || null,
+          };
+        });
+        const { error: insErr } = await supabase.from('pairs').insert(rows);
+        if (insErr) throw insErr;
+        await updateRound(round.id, {
+          status: 'aprovado',
+          approved_by: state.profile.id,
+          approved_at: new Date().toISOString(),
+        });
+        renderRound();
+      } catch (err) {
+        alert('Erro ao salvar: ' + err.message);
+        saveBtn.disabled = false;
+      }
+    });
+
+    const cancelManualBtn = el('button', { class: 'btn btn-block', style: 'margin-top:0.5rem;' }, 'Cancelar e voltar');
+    cancelManualBtn.addEventListener('click', () => renderRound());
+
+    renderPool();
+    renderPairsList();
+    renderForm();
+
+    resultHost.append(poolHost, pairsHost, formHost, saveBtn, cancelManualBtn);
+  }
+
   const drawBtn = el('button', { class: 'btn btn-primary btn-block' }, 'Sortear duplas');
   drawBtn.addEventListener('click', () => {
     drawBtn.remove();
+    manualBtn.remove();
     runDraw();
   });
-  resultHost.append(drawBtn);
+  const manualBtn = el(
+    'button',
+    { class: 'btn btn-block', style: 'margin-top:0.5rem;' },
+    'Lançar duplas manualmente (sorteio feito fora do sistema)'
+  );
+  manualBtn.addEventListener('click', () => {
+    drawBtn.remove();
+    manualBtn.remove();
+    renderManualPairing();
+  });
+  resultHost.append(drawBtn, manualBtn);
   stepHost.append(discardBtn);
 }
 
